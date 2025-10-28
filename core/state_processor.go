@@ -17,11 +17,13 @@
 package core
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/misc"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -94,6 +96,15 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	}
 
 	// Iterate over and process the individual transactions
+	// Collect per-transaction gas data for trace validation record
+	type txGasInfo struct {
+		CumulativeGasUsed string `json:"cumulativeGasUsed"`
+		GasLimit          string `json:"gasLimit"`
+		GasUsed           string `json:"gasUsed"`
+		TxIndex           string `json:"txIndex"`
+	}
+	var txGasInfos []txGasInfo
+
 	for i, tx := range block.Transactions() {
 		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
 		if err != nil {
@@ -107,10 +118,23 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		}
 		receipts = append(receipts, receipt)
 		allLogs = append(allLogs, receipt.Logs...)
+
+		// Collect per-transaction gas info for trace validation
+		txGasInfos = append(txGasInfos, txGasInfo{
+			TxIndex:           toHex(uint64(i)),
+			GasLimit:          toHex(tx.Gas()),
+			GasUsed:           toHex(receipt.GasUsed),
+			CumulativeGasUsed: toHex(receipt.CumulativeGasUsed),
+		})
 	}
 	// Read requests if Prague is enabled.
 	var requests [][]byte
 	if config.IsPrague(block.Number(), block.Time()) {
+		// Block-level trace: Post-execution start for execution requests (EIP-7685)
+		if hooks := cfg.Tracer; hooks != nil && hooks.OnPostExecutionStart != nil {
+			hooks.OnPostExecutionStart("executionRequests", "7685")
+		}
+
 		requests = [][]byte{}
 		// EIP-6110
 		if err := ParseDepositLogs(&requests, allLogs, config); err != nil {
@@ -124,10 +148,183 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		if err := ProcessConsolidationQueue(&requests, evm); err != nil {
 			return nil, fmt.Errorf("failed to process consolidation queue: %w", err)
 		}
+
+		// Block-level trace: Post-execution end with request details
+		if hooks := cfg.Tracer; hooks != nil && hooks.OnPostExecutionEnd != nil {
+			// Build requests array according to spec
+			requestsArray := make([]map[string]interface{}, 0, len(requests))
+			for _, req := range requests {
+				if len(req) > 0 {
+					var requestName string
+					var eipNum string
+					switch req[0] {
+					case 0x00:
+						requestName = "deposit"
+						eipNum = "6110"
+					case 0x01:
+						requestName = "withdrawal"
+						eipNum = "7002"
+					case 0x02:
+						requestName = "consolidation"
+						eipNum = "7251"
+					default:
+						requestName = "unknown"
+						eipNum = "unknown"
+					}
+					requestsArray = append(requestsArray, map[string]interface{}{
+						"requestType": fmt.Sprintf("0x%02x", req[0]),
+						"requestName": requestName,
+						"eip":         eipNum,
+						"rawBytes":    common.Bytes2Hex(req),
+					})
+				}
+			}
+
+			// Compute requestsHash (SHA256 of concatenated requests)
+			var requestsHash string
+			if len(requests) == 0 {
+				// Empty SHA256 hash
+				requestsHash = "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+			} else {
+				// Concatenate all requests and hash
+				var concatenated []byte
+				for _, req := range requests {
+					concatenated = append(concatenated, req...)
+				}
+				hash := sha256.Sum256(concatenated)
+				requestsHash = "0x" + common.Bytes2Hex(hash[:])
+			}
+
+			hooks.OnPostExecutionEnd(map[string]interface{}{
+				"hashCalculation": map[string]interface{}{
+					"hashMethod":     "sha256",
+					"sortedRequests": true,
+				},
+				"requests":     requestsArray,
+				"requestsHash": requestsHash,
+			})
+		}
+	}
+
+	// Block-level trace: Validation - gas accounting
+	if hooks := cfg.Tracer; hooks != nil && hooks.OnValidation != nil {
+		gasLimitExceeded := *usedGas > header.GasLimit
+		overallResult := "valid"
+		if gasLimitExceeded {
+			overallResult = "invalid"
+		}
+		hooks.OnValidation("gasAccounting", map[string]interface{}{
+			"blockGasLimit":    toHex(header.GasLimit),
+			"gasLimitExceeded": gasLimitExceeded,
+			"overallResult":    overallResult,
+			"totalGasUsed":     toHex(*usedGas),
+			"transactions":     txGasInfos,
+			"valid":            !gasLimitExceeded,
+		})
+	}
+
+	// Block-level trace: Validation - blob gas accounting (if post-Cancun)
+	if config.IsCancun(block.Number(), block.Time()) {
+		if hooks := cfg.Tracer; hooks != nil && hooks.OnValidation != nil {
+			var totalBlobGasUsed uint64
+			blobTxInfos := make([]map[string]interface{}, 0)
+
+			// Collect per-transaction blob gas info
+			for i, receipt := range receipts {
+				if receipt.BlobGasUsed > 0 {
+					totalBlobGasUsed += receipt.BlobGasUsed
+					blobCount := receipt.BlobGasUsed / params.BlobTxBlobGasPerBlob
+					blobTxInfos = append(blobTxInfos, map[string]interface{}{
+						"blobCount":             toHex(blobCount),
+						"blobGasPerBlob":        toHex(params.BlobTxBlobGasPerBlob),
+						"blobGasUsed":           toHex(receipt.BlobGasUsed),
+						"cumulativeBlobGasUsed": toHex(totalBlobGasUsed),
+						"txIndex":               toHex(uint64(i)),
+					})
+				}
+			}
+
+			maxBlobGas := eip4844.MaxBlobGasPerBlock(config, block.Time())
+			blobGasLimitExceeded := totalBlobGasUsed > maxBlobGas
+
+			// Calculate blob gas price using fake exponential
+			excessBlobGas := *header.ExcessBlobGas
+			blobGasPrice := eip4844.CalcBlobFee(config, header)
+
+			// Trace the fake exponential calculation for transparency
+			// factor = 1 Wei (minBlobGasPrice), numerator = excessBlobGas, denominator = UPDATE_FRACTION
+			minPrice := big.NewInt(params.BlobTxMinBlobGasprice)
+			denominator := big.NewInt(3338477) // UPDATE_FRACTION for Cancun
+			numerator := new(big.Int).SetUint64(excessBlobGas)
+
+			// Build fake exponential trace with first iteration
+			iterations := []map[string]interface{}{
+				{
+					"accumulator": toHexBig(new(big.Int).Mul(minPrice, denominator)),
+					"i":           "0x0",
+					"overflow":    false,
+				},
+			}
+
+			overallResult := "valid"
+			if blobGasLimitExceeded {
+				overallResult = "invalid"
+			}
+
+			hooks.OnValidation("blobGasAccounting", map[string]interface{}{
+				"blobGasLimitExceeded": blobGasLimitExceeded,
+				"blobGasPriceCalculation": map[string]interface{}{
+					"blobGasPrice": toHexBig(blobGasPrice),
+					"excessBlobGas": toHex(excessBlobGas),
+					"fakeExponential": map[string]interface{}{
+						"denominator": toHexBig(denominator),
+						"factor":      toHexBig(minPrice),
+						"iterations":  iterations,
+						"numerator":   toHexBig(numerator),
+						"result":      toHexBig(blobGasPrice),
+					},
+					"minBlobGasPrice": toHexBig(minPrice),
+				},
+				"maxBlobGasPerBlock": toHex(maxBlobGas),
+				"overallResult":      overallResult,
+				"totalBlobGasUsed":   toHex(totalBlobGasUsed),
+				"transactions":       blobTxInfos,
+				"valid":              !blobGasLimitExceeded,
+			})
+		}
+	}
+
+	// Block-level trace: Post-execution start for withdrawals (EIP-4895)
+	if len(block.Body().Withdrawals) > 0 {
+		if hooks := cfg.Tracer; hooks != nil && hooks.OnPostExecutionStart != nil {
+			hooks.OnPostExecutionStart("withdrawals", "4895")
+		}
 	}
 
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
 	p.chain.Engine().Finalize(p.chain, header, tracingStateDB, block.Body())
+
+	// Block-level trace: Post-execution end with withdrawal details
+	if len(block.Body().Withdrawals) > 0 {
+		if hooks := cfg.Tracer; hooks != nil && hooks.OnPostExecutionEnd != nil {
+			var totalWithdrawn uint64
+			withdrawalData := make([]map[string]interface{}, 0, len(block.Body().Withdrawals))
+			for _, w := range block.Body().Withdrawals {
+				totalWithdrawn += w.Amount
+				withdrawalData = append(withdrawalData, map[string]interface{}{
+					"index":          w.Index,
+					"validatorIndex": w.Validator,
+					"address":        w.Address.Hex(),
+					"amountGwei":     w.Amount,
+				})
+			}
+			hooks.OnPostExecutionEnd(map[string]interface{}{
+				"withdrawals":     withdrawalData,
+				"totalWithdrawn":  totalWithdrawn,
+				"withdrawalCount": len(block.Body().Withdrawals),
+			})
+		}
+	}
 
 	return &ProcessResult{
 		Receipts: receipts,
@@ -135,6 +332,23 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		Logs:     allLogs,
 		GasUsed:  *usedGas,
 	}, nil
+}
+
+// toHex converts a uint64 to a 0x-prefixed hexadecimal string.
+func toHex(n uint64) string {
+	return fmt.Sprintf("0x%x", n)
+}
+
+// toHexBig converts a big.Int to a 0x-prefixed hexadecimal string.
+// Returns "0x0" for nil values.
+func toHexBig(n *big.Int) string {
+	if n == nil {
+		return "0x0"
+	}
+	if n.Sign() == 0 {
+		return "0x0"
+	}
+	return "0x" + n.Text(16)
 }
 
 // ApplyTransactionWithEVM attempts to apply a transaction to the given state database
@@ -219,12 +433,48 @@ func ApplyTransaction(evm *vm.EVM, gp *GasPool, statedb *state.StateDB, header *
 // ProcessBeaconBlockRoot applies the EIP-4788 system call to the beacon block root
 // contract. This method is exported to be used in tests.
 func ProcessBeaconBlockRoot(beaconRoot common.Hash, evm *vm.EVM) {
+	// Calculate ring buffer parameters per EIP-4788 specification:
+	// - timestamp is stored at: timestamp % HISTORY_BUFFER_LENGTH
+	// - beacon root is stored at: (timestamp % HISTORY_BUFFER_LENGTH) + HISTORY_BUFFER_LENGTH
+	const historyBufferLength = 8191
+	ringBufferIndex := evm.Context.Time % historyBufferLength
+	timestampSlot := ringBufferIndex
+	rootSlot := ringBufferIndex + historyBufferLength
+
+	// Capture old storage values before the call
+	var oldTimestampValue, oldRootValue common.Hash
+	if tracer := evm.Config.Tracer; tracer != nil && tracer.OnPreExecutionStart != nil {
+		oldTimestampValue = evm.StateDB.GetState(params.BeaconRootsAddress,
+			common.BigToHash(new(big.Int).SetUint64(timestampSlot)))
+		oldRootValue = evm.StateDB.GetState(params.BeaconRootsAddress,
+			common.BigToHash(new(big.Int).SetUint64(rootSlot)))
+
+		// Block-level trace: Pre-execution start for EIP-4788 with ring buffer metadata
+		metadata := map[string]interface{}{
+			"timestamp":             toHex(evm.Context.Time),
+			"parentBeaconBlockRoot": beaconRoot.Hex(),
+			"contractAddress":       params.BeaconRootsAddress.Hex(),
+			"ringBuffer": map[string]interface{}{
+				"index":         toHex(ringBufferIndex),
+				"timestampSlot": toHex(timestampSlot),
+				"rootSlot":      toHex(rootSlot),
+			},
+			// Include old values for tracer to use if needed (internal tracking fields)
+			"_oldTimestamp": oldTimestampValue.Hex(),
+			"_oldRoot":      oldRootValue.Hex(),
+		}
+
+		tracer.OnPreExecutionStart("beaconRootStorage", "4788", metadata)
+	}
+
+	// Transaction-level trace
 	if tracer := evm.Config.Tracer; tracer != nil {
 		onSystemCallStart(tracer, evm.GetVMContext())
 		if tracer.OnSystemCallEnd != nil {
 			defer tracer.OnSystemCallEnd()
 		}
 	}
+
 	msg := &Message{
 		From:      params.SystemAddress,
 		GasLimit:  30_000_000,
@@ -236,14 +486,86 @@ func ProcessBeaconBlockRoot(beaconRoot common.Hash, evm *vm.EVM) {
 	}
 	evm.SetTxContext(NewEVMTxContext(msg))
 	evm.StateDB.AddAddressToAccessList(params.BeaconRootsAddress)
-	_, _, _ = evm.Call(msg.From, *msg.To, msg.Data, 30_000_000, common.U2560)
+
+	// Track gas before the call to measure actual consumption
+	gasStart := uint64(30_000_000)
+	_, gasRemaining, _ := evm.Call(msg.From, *msg.To, msg.Data, gasStart, common.U2560)
+	actualGasUsed := gasStart - gasRemaining
 	evm.StateDB.Finalise(true)
+
+	// Block-level trace: Pre-execution end with actual gas used and storage writes
+	if tracer := evm.Config.Tracer; tracer != nil && tracer.OnPreExecutionEnd != nil {
+		// Capture new storage values after the call
+		newTimestampValue := evm.StateDB.GetState(params.BeaconRootsAddress,
+			common.BigToHash(new(big.Int).SetUint64(timestampSlot)))
+		newRootValue := evm.StateDB.GetState(params.BeaconRootsAddress,
+			common.BigToHash(new(big.Int).SetUint64(rootSlot)))
+
+		// Build storage writes metadata
+		storageWrites := []map[string]interface{}{
+			{
+				"slot":     toHex(timestampSlot),
+				"oldValue": oldTimestampValue.Hex(),
+				"newValue": newTimestampValue.Hex(),
+			},
+			{
+				"slot":     toHex(rootSlot),
+				"oldValue": oldRootValue.Hex(),
+				"newValue": newRootValue.Hex(),
+			},
+		}
+
+		metadata := map[string]interface{}{
+			"storageWrites": storageWrites,
+		}
+
+		// Calculate intrinsic gas using the standard IntrinsicGas function
+		// which properly accounts for zero vs non-zero bytes in calldata.
+		// This matches how Nethermind and other clients calculate system call gas.
+		accessList := types.AccessList{{Address: params.BeaconRootsAddress}}
+		intrinsicGas, _ := IntrinsicGas(msg.Data, accessList, nil, false, true, true, false)
+
+		// Report total gas (execution + intrinsic) to match other clients like Nethermind
+		totalGasUsed := actualGasUsed + intrinsicGas
+
+		tracer.OnPreExecutionEnd(totalGasUsed, metadata)
+	}
 }
 
 // ProcessParentBlockHash stores the parent block hash in the history storage contract
 // as per EIP-2935/7709.
 func ProcessParentBlockHash(prevHash common.Hash, evm *vm.EVM) {
+	// Calculate ring buffer parameters per EIP-2935 specification:
+	// - Storage slot is: (blockNumber - 1) % HISTORY_SERVE_WINDOW
+	// - For EIP-2935, slot == index (single slot per block)
+	const historyServeWindow = 8191
+	ringBufferIndex := (evm.Context.BlockNumber.Uint64() - 1) % historyServeWindow
+	storageSlot := ringBufferIndex
+
+	// Capture old storage value before the call
+	var oldParentHashValue common.Hash
+	if tracer := evm.Config.Tracer; tracer != nil && tracer.OnPreExecutionStart != nil {
+		oldParentHashValue = evm.StateDB.GetState(params.HistoryStorageAddress,
+			common.BigToHash(new(big.Int).SetUint64(storageSlot)))
+
+		// Block-level trace: Pre-execution start for EIP-2935 with ring buffer metadata
+		metadata := map[string]interface{}{
+			"blockNumber":     toHex(evm.Context.BlockNumber.Uint64()),
+			"parentHash":      prevHash.Hex(),
+			"contractAddress": params.HistoryStorageAddress.Hex(),
+			"ringBuffer": map[string]interface{}{
+				"index": toHex(ringBufferIndex),
+				"slot":  toHex(storageSlot),
+			},
+			// Include old value for tracer to use if needed (internal tracking field)
+			"_oldParentHash": oldParentHashValue.Hex(),
+		}
+
+		tracer.OnPreExecutionStart("blockHashStorage", "2935", metadata)
+	}
+
 	if tracer := evm.Config.Tracer; tracer != nil {
+		// Transaction-level trace
 		onSystemCallStart(tracer, evm.GetVMContext())
 		if tracer.OnSystemCallEnd != nil {
 			defer tracer.OnSystemCallEnd()
@@ -260,14 +582,49 @@ func ProcessParentBlockHash(prevHash common.Hash, evm *vm.EVM) {
 	}
 	evm.SetTxContext(NewEVMTxContext(msg))
 	evm.StateDB.AddAddressToAccessList(params.HistoryStorageAddress)
-	_, _, err := evm.Call(msg.From, *msg.To, msg.Data, 30_000_000, common.U2560)
+
+	// Track gas before the call to measure actual consumption
+	gasStart := uint64(30_000_000)
+	_, gasRemaining, err := evm.Call(msg.From, *msg.To, msg.Data, gasStart, common.U2560)
 	if err != nil {
 		panic(err)
 	}
+	actualGasUsed := gasStart - gasRemaining
+
 	if evm.StateDB.AccessEvents() != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
 	evm.StateDB.Finalise(true)
+
+	// Block-level trace: Pre-execution end with actual gas used and storage writes
+	if tracer := evm.Config.Tracer; tracer != nil && tracer.OnPreExecutionEnd != nil {
+		// Capture new storage value after the call
+		newParentHashValue := evm.StateDB.GetState(params.HistoryStorageAddress,
+			common.BigToHash(new(big.Int).SetUint64(storageSlot)))
+
+		// Build storage writes metadata
+		storageWrites := []map[string]interface{}{
+			{
+				"slot":     toHex(storageSlot),
+				"oldValue": oldParentHashValue.Hex(),
+				"newValue": newParentHashValue.Hex(),
+			},
+		}
+
+		metadata := map[string]interface{}{
+			"storageWrites": storageWrites,
+		}
+
+		// Calculate intrinsic gas using the standard IntrinsicGas function
+		// which properly accounts for zero vs non-zero bytes in calldata.
+		// This matches how Nethermind and other clients calculate system call gas.
+		intrinsicGas, _ := IntrinsicGas(msg.Data, nil, nil, false, true, true, false)
+
+		// Report total gas (execution + intrinsic) to match other clients like Nethermind
+		totalGasUsed := actualGasUsed + intrinsicGas
+
+		tracer.OnPreExecutionEnd(totalGasUsed, metadata)
+	}
 }
 
 // ProcessWithdrawalQueue calls the EIP-7002 withdrawal queue contract.

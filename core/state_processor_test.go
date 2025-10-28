@@ -29,7 +29,9 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
@@ -428,4 +430,185 @@ func GenerateBadBlock(parent *types.Block, engine consensus.Engine, txs types.Tr
 		body.Withdrawals = []*types.Withdrawal{}
 	}
 	return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil))
+}
+
+// TestProcessBeaconBlockRootSlotCalculation verifies that EIP-4788 slot calculations
+// are correct according to the specification.
+// Per EIP-4788:
+//   - timestamp is stored at: timestamp % HISTORY_BUFFER_LENGTH
+//   - beacon root is stored at: (timestamp % HISTORY_BUFFER_LENGTH) + HISTORY_BUFFER_LENGTH
+func TestProcessBeaconBlockRootSlotCalculation(t *testing.T) {
+	const historyBufferLength = 8191
+
+	tests := []struct {
+		name          string
+		timestamp     uint64
+		wantTimestamp uint64
+		wantRoot      uint64
+	}{
+		{
+			name:          "timestamp 0",
+			timestamp:     0,
+			wantTimestamp: 0,
+			wantRoot:      8191,
+		},
+		{
+			name:          "timestamp 1000 (0x3e8)",
+			timestamp:     1000,
+			wantTimestamp: 1000,
+			wantRoot:      9191, // 1000 + 8191
+		},
+		{
+			name:          "timestamp at buffer boundary",
+			timestamp:     8191,
+			wantTimestamp: 0, // wraps around
+			wantRoot:      8191,
+		},
+		{
+			name:          "timestamp past buffer boundary",
+			timestamp:     8192,
+			wantTimestamp: 1,
+			wantRoot:      8192, // 1 + 8191
+		},
+		{
+			name:          "large timestamp",
+			timestamp:     1000000,
+			wantTimestamp: 1000000 % historyBufferLength, // 1336
+			wantRoot:      (1000000 % historyBufferLength) + historyBufferLength, // 9527
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Setup a minimal state and EVM for testing
+			var (
+				db      = rawdb.NewMemoryDatabase()
+				gspec   = &Genesis{
+					Config: params.MergedTestChainConfig,
+					Alloc:  types.GenesisAlloc{},
+				}
+				beaconRoot = common.HexToHash("0xbeac00112233445566778899aabbccddeeff00112233445566778899aabbccdd")
+			)
+
+			// Install the beacon roots contract
+			gspec.Alloc[params.BeaconRootsAddress] = types.Account{
+				Balance: common.Big0,
+				Nonce:   1,
+				Code:    common.FromHex("3373fffffffffffffffffffffffffffffffffffffffe14604d57602036146024575f5ffd5b5f35801560495762001fff810690815414603c575f5ffd5b62001fff01545f5260205ff35b5f5ffd5b62001fff42064281555f359062001fff015500"),
+			}
+
+			// Create genesis block and blockchain
+			blockchain, err := NewBlockChain(db, gspec, beacon.New(ethash.NewFaker()), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blockchain.Stop()
+
+			// Create a tracer to capture the slot calculations
+			var capturedMetadata map[string]interface{}
+
+			config := params.MergedTestChainConfig
+			statedb, err := blockchain.State()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Create block context with the test timestamp
+			header := &types.Header{
+				Number:     big.NewInt(1),
+				GasLimit:   10000000,
+				Time:       tt.timestamp,
+				Difficulty: big.NewInt(0),
+				BaseFee:    big.NewInt(params.InitialBaseFee),
+			}
+
+			// Configure tracer to capture metadata
+			vmConfig := &vm.Config{
+				Tracer: &tracing.Hooks{
+					OnPreExecutionStart: func(name string, eip string, metadata map[string]interface{}) {
+						if name == "beaconRootStorage" {
+							capturedMetadata = metadata
+						}
+					},
+				},
+			}
+
+			// Create EVM
+			blockContext := NewEVMBlockContext(header, blockchain, nil)
+			evm := vm.NewEVM(blockContext, statedb, config, *vmConfig)
+
+			// Call ProcessBeaconBlockRoot
+			ProcessBeaconBlockRoot(beaconRoot, evm)
+
+			// Verify captured metadata
+			if capturedMetadata == nil {
+				t.Fatal("metadata was not captured")
+			}
+
+			ringBuffer, ok := capturedMetadata["ringBuffer"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("ringBuffer metadata not found or wrong type: %+v", capturedMetadata)
+			}
+
+			// Parse and verify index
+			indexHex, ok := ringBuffer["index"].(string)
+			if !ok {
+				t.Fatalf("index not found in ringBuffer: %+v", ringBuffer)
+			}
+			gotIndex := hexToUint64(t, indexHex)
+			wantIndex := tt.timestamp % historyBufferLength
+			if gotIndex != wantIndex {
+				t.Errorf("ringBufferIndex = %d (0x%x), want %d (0x%x)",
+					gotIndex, gotIndex, wantIndex, wantIndex)
+			}
+
+			// Parse and verify timestamp slot
+			timestampSlotHex, ok := ringBuffer["timestampSlot"].(string)
+			if !ok {
+				t.Fatalf("timestampSlot not found in ringBuffer: %+v", ringBuffer)
+			}
+			gotTimestampSlot := hexToUint64(t, timestampSlotHex)
+			if gotTimestampSlot != tt.wantTimestamp {
+				t.Errorf("timestampSlot = %d (0x%x), want %d (0x%x)",
+					gotTimestampSlot, gotTimestampSlot, tt.wantTimestamp, tt.wantTimestamp)
+			}
+
+			// Parse and verify root slot
+			rootSlotHex, ok := ringBuffer["rootSlot"].(string)
+			if !ok {
+				t.Fatalf("rootSlot not found in ringBuffer: %+v", ringBuffer)
+			}
+			gotRootSlot := hexToUint64(t, rootSlotHex)
+			if gotRootSlot != tt.wantRoot {
+				t.Errorf("rootSlot = %d (0x%x), want %d (0x%x)",
+					gotRootSlot, gotRootSlot, tt.wantRoot, tt.wantRoot)
+			}
+		})
+	}
+}
+
+// hexToUint64 converts a hex string (with or without 0x prefix) to uint64
+func hexToUint64(t *testing.T, s string) uint64 {
+	t.Helper()
+	if len(s) > 2 && s[:2] == "0x" {
+		s = s[2:]
+	}
+	if s == "" || s == "0" {
+		return 0
+	}
+	var result uint64
+	for _, c := range s {
+		result *= 16
+		switch {
+		case c >= '0' && c <= '9':
+			result += uint64(c - '0')
+		case c >= 'a' && c <= 'f':
+			result += uint64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			result += uint64(c-'A') + 10
+		default:
+			t.Fatalf("invalid hex string: %s", s)
+		}
+	}
+	return result
 }

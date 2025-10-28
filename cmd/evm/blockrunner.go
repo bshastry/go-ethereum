@@ -87,11 +87,11 @@ type traceEndMarker struct {
 }
 
 type traceEndDetails struct {
+	Error string `json:"error,omitempty"`
+	Fork  string `json:"fork"`
 	Name  string `json:"name"`
 	Pass  bool   `json:"pass"`
-	Fork  string `json:"fork"`
 	Root  string `json:"root,omitempty"`
-	Error string `json:"error,omitempty"`
 }
 
 // writeTraceEndMarker writes a blocktest end marker to stderr in JSONL format.
@@ -128,7 +128,6 @@ func runBlockTest(ctx *cli.Context, fname string) ([]testResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid regex -%s: %v", RunFlag.Name, err)
 	}
-	tracer := tracerFromFlags(ctx)
 
 	// Pull out keys to sort and ensure tests are run in order.
 	keys := slices.Sorted(maps.Keys(tests))
@@ -140,6 +139,12 @@ func runBlockTest(ctx *cli.Context, fname string) ([]testResult, error) {
 			continue
 		}
 		test := tests[name]
+
+		// Create tracer with the fork name from the test
+		// This allows the block tracer to correctly identify Osaka vs Prague
+		// since both have RequestsHash in the header but differ in fork name
+		tracer := tracerFromFlags(ctx, test.Network())
+
 		result := &testResult{Name: name, Pass: true}
 		var finalRoot *common.Hash
 		if err := test.Run(false, rawdb.PathScheme, ctx.Bool(WitnessCrossCheckFlag.Name), tracer, func(res error, chain *core.BlockChain) {

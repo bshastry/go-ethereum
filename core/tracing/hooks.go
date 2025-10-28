@@ -188,6 +188,62 @@ type (
 
 	// BlockHashReadHook is called when EVM reads the blockhash of a block.
 	BlockHashReadHook = func(blockNumber uint64, hash common.Hash)
+
+	/*
+		- Block-level tracing events -
+
+		These hooks enable comprehensive block-level execution tracing as specified in the
+		EIP Block-Level Execution Trace Specification (extends EIP-3155).
+	*/
+
+	// PreExecutionStartHook is called before a pre-execution operation begins.
+	// Pre-execution operations include system calls that occur before regular transactions:
+	//   - EIP-4788: Beacon block root storage (operation="beaconRootStorage", eip="4788")
+	//   - EIP-2935: Historical block hash storage (operation="blockHashStorage", eip="2935")
+	//
+	// The metadata map contains operation-specific details such as:
+	//   - timestamp, parentBeaconBlockRoot, contractAddress, ringBuffer (for EIP-4788)
+	//   - blockNumber, parentHash, contractAddress, ringBuffer (for EIP-2935)
+	PreExecutionStartHook = func(operation string, eip string, metadata map[string]interface{})
+
+	// PreExecutionEndHook is called after a pre-execution operation completes.
+	// The gasUsed parameter indicates the gas consumed by the system call.
+	// The metadata parameter contains operation-specific results such as storage writes.
+	PreExecutionEndHook = func(gasUsed uint64, metadata map[string]interface{})
+
+	// PostExecutionStartHook is called before a post-execution operation begins.
+	// Post-execution operations occur after all transactions have executed:
+	//   - EIP-4895: Withdrawals (operation="withdrawals", eip="4895")
+	//   - EIP-7685: Execution requests (operation="executionRequests", eip="7685")
+	//     - EIP-6110: Deposit requests
+	//     - EIP-7002: Withdrawal requests
+	//     - EIP-7251: Consolidation requests
+	PostExecutionStartHook = func(operation string, eip string)
+
+	// PostExecutionEndHook is called after a post-execution operation completes.
+	// The metadata map contains operation-specific results such as:
+	//   - withdrawals, totalWithdrawn, accountsCreated (for withdrawals)
+	//   - requests, requestsHash (for execution requests)
+	PostExecutionEndHook = func(metadata map[string]interface{})
+
+	// ValidationHook is called when validation operations occur.
+	// Validation operations verify block correctness:
+	//   - "headerValidation": Gas limit, timestamp, base fee, excess blob gas validation
+	//   - "gasAccounting": Transaction gas usage and cumulative gas tracking
+	//   - "blobGasAccounting": Blob gas price calculation and usage tracking (EIP-4844)
+	//
+	// The details map contains validation rules, calculations, and results.
+	ValidationHook = func(operation string, details map[string]interface{})
+
+	// TrieOperationHook is called during Merkle/Verkle trie computations.
+	// Trie operations compute consensus-critical root hashes:
+	//   - "stateRoot": Account state trie root computation
+	//   - "receiptRoot": Transaction receipts trie root computation
+	//   - "transactionRoot": Transactions trie root computation
+	//   - "withdrawalsRoot": Withdrawals trie root computation (post-Shanghai)
+	//
+	// The details map contains trie type, account/storage updates, and computed roots.
+	TrieOperationHook = func(operation string, details map[string]interface{})
 )
 
 type Hooks struct {
@@ -219,6 +275,13 @@ type Hooks struct {
 	OnLog           LogHook
 	// Block hash read
 	OnBlockHashRead BlockHashReadHook
+	// Block-level tracing events (EIP Block-Level Execution Trace Specification)
+	OnPreExecutionStart  PreExecutionStartHook
+	OnPreExecutionEnd    PreExecutionEndHook
+	OnPostExecutionStart PostExecutionStartHook
+	OnPostExecutionEnd   PostExecutionEndHook
+	OnValidation         ValidationHook
+	OnTrieOperation      TrieOperationHook
 }
 
 // BalanceChangeReason is used to indicate the reason for a balance change, useful

@@ -151,6 +151,14 @@ func (t *BlockTest) run(config *params.ChainConfig, snapshotter bool, scheme str
 	}
 	triedb.Close() // close the db to prevent memory leak
 
+	// Trace genesis block for compatibility with Nethermind
+	if tracer != nil && tracer.OnBlockStart != nil {
+		tracer.OnBlockStart(tracing.BlockEvent{Block: gblock})
+	}
+	if tracer != nil && tracer.OnBlockEnd != nil {
+		tracer.OnBlockEnd(nil)
+	}
+
 	if gblock.Hash() != t.json.Genesis.Hash {
 		return fmt.Errorf("genesis block hash doesn't match test: computed=%x, test=%x", gblock.Hash().Bytes()[:6], t.json.Genesis.Hash[:6])
 	}
