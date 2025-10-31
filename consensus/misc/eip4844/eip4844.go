@@ -53,6 +53,12 @@ func (bc *BlobConfig) blobPrice(excessBlobGas uint64) *big.Int {
 	return new(big.Int).Mul(f, big.NewInt(params.BlobTxBlobGasPerBlob))
 }
 
+// LatestBlobConfig returns the blob configuration for the given chain config and time.
+// It is exported for use in tracing code.
+func LatestBlobConfig(cfg *params.ChainConfig, time uint64) *BlobConfig {
+	return latestBlobConfig(cfg, time)
+}
+
 func latestBlobConfig(cfg *params.ChainConfig, time uint64) *BlobConfig {
 	if cfg.BlobScheduleConfig == nil {
 		return nil

@@ -327,8 +327,10 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 
 			// Trace the fake exponential calculation for transparency
 			// factor = 1 Wei (minBlobGasPrice), numerator = excessBlobGas, denominator = UPDATE_FRACTION
+			// Get the fork-specific UpdateFraction for accurate tracing
+			blobConfig := eip4844.LatestBlobConfig(config, block.Time())
 			minPrice := big.NewInt(params.BlobTxMinBlobGasprice)
-			denominator := big.NewInt(3338477) // UPDATE_FRACTION for Cancun
+			denominator := new(big.Int).SetUint64(blobConfig.UpdateFraction)
 			numerator := new(big.Int).SetUint64(excessBlobGas)
 
 			// Build fake exponential trace with first iteration
