@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/misc"
@@ -30,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 )
 
 // StateProcessor is a basic Processor, which takes care of transitioning
@@ -127,6 +129,78 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 			CumulativeGasUsed: toHex(receipt.CumulativeGasUsed),
 		})
 	}
+
+	// Block-level trace: Withdrawals (EIP-4895) - process before execution requests
+	// This matches Nethermind's trace ordering
+	if len(block.Body().Withdrawals) > 0 {
+		if hooks := cfg.Tracer; hooks != nil && hooks.OnPostExecutionStart != nil {
+			hooks.OnPostExecutionStart("withdrawals", "4895")
+		}
+
+		// Track account lifecycle for withdrawals
+		var accountsCreated uint64
+		var emptyAccountsDeleted uint64
+
+		// Process withdrawals and track balance changes
+		var totalWithdrawn uint64
+		withdrawalData := make([]map[string]interface{}, 0, len(block.Body().Withdrawals))
+
+		for _, w := range block.Body().Withdrawals {
+			// Get balance before withdrawal
+			balanceBefore := statedb.GetBalance(w.Address)
+
+			// Check if account exists before withdrawal
+			accountExistedBefore := statedb.Exist(w.Address)
+
+			// Convert amount from gwei to wei
+			amount := new(uint256.Int).SetUint64(w.Amount)
+			amountWei := new(uint256.Int).Mul(amount, uint256.NewInt(params.GWei))
+
+			// Apply withdrawal
+			statedb.AddBalance(w.Address, amountWei, tracing.BalanceIncreaseWithdrawal)
+
+			// Get balance after withdrawal
+			balanceAfter := statedb.GetBalance(w.Address)
+
+			// Check if account was created by this withdrawal
+			if !accountExistedBefore && statedb.Exist(w.Address) {
+				accountsCreated++
+			}
+
+			// Track total withdrawn (in gwei)
+			totalWithdrawn += w.Amount
+
+			// Build withdrawal trace entry with balance tracking
+			// Use lowercase address as per canonical format (not EIP-55 checksum)
+			withdrawalEntry := map[string]interface{}{
+				"address":        strings.ToLower(w.Address.Hex()),
+				"amountGwei":     toHex(w.Amount),
+				"index":          toHex(w.Index),
+				"validatorIndex": toHex(w.Validator),
+			}
+
+			// Add balance change tracking
+			balanceDelta := new(uint256.Int).Sub(balanceAfter, balanceBefore)
+			withdrawalEntry["balanceChange"] = map[string]interface{}{
+				"before": balanceBefore.Hex(),
+				"after":  balanceAfter.Hex(),
+				"delta":  balanceDelta.Hex(),
+			}
+
+			withdrawalData = append(withdrawalData, withdrawalEntry)
+		}
+
+		// Emit withdrawal trace with canonical format
+		if hooks := cfg.Tracer; hooks != nil && hooks.OnPostExecutionEnd != nil {
+			hooks.OnPostExecutionEnd(map[string]interface{}{
+				"accountsCreated":      toHex(accountsCreated),
+				"emptyAccountsDeleted": toHex(emptyAccountsDeleted),
+				"totalWithdrawn":       toHex(totalWithdrawn),
+				"withdrawals":          withdrawalData,
+			})
+		}
+	}
+
 	// Read requests if Prague is enabled.
 	var requests [][]byte
 	if config.IsPrague(block.Number(), block.Time()) {
@@ -294,37 +368,16 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		}
 	}
 
-	// Block-level trace: Post-execution start for withdrawals (EIP-4895)
-	if len(block.Body().Withdrawals) > 0 {
-		if hooks := cfg.Tracer; hooks != nil && hooks.OnPostExecutionStart != nil {
-			hooks.OnPostExecutionStart("withdrawals", "4895")
-		}
-	}
-
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
-	p.chain.Engine().Finalize(p.chain, header, tracingStateDB, block.Body())
-
-	// Block-level trace: Post-execution end with withdrawal details
-	if len(block.Body().Withdrawals) > 0 {
-		if hooks := cfg.Tracer; hooks != nil && hooks.OnPostExecutionEnd != nil {
-			var totalWithdrawn uint64
-			withdrawalData := make([]map[string]interface{}, 0, len(block.Body().Withdrawals))
-			for _, w := range block.Body().Withdrawals {
-				totalWithdrawn += w.Amount
-				withdrawalData = append(withdrawalData, map[string]interface{}{
-					"index":          w.Index,
-					"validatorIndex": w.Validator,
-					"address":        w.Address.Hex(),
-					"amountGwei":     w.Amount,
-				})
-			}
-			hooks.OnPostExecutionEnd(map[string]interface{}{
-				"withdrawals":     withdrawalData,
-				"totalWithdrawn":  totalWithdrawn,
-				"withdrawalCount": len(block.Body().Withdrawals),
-			})
-		}
+	// Note: Withdrawals have already been processed above (before execution requests) to match
+	// Nethermind's trace ordering. We pass an empty withdrawal list to Finalize to prevent
+	// double-processing while still allowing other finalization logic (e.g. pre-merge rewards).
+	bodyWithoutWithdrawals := &types.Body{
+		Transactions: block.Body().Transactions,
+		Uncles:       block.Body().Uncles,
+		Withdrawals:  nil, // Already processed above
 	}
+	p.chain.Engine().Finalize(p.chain, header, tracingStateDB, bodyWithoutWithdrawals)
 
 	return &ProcessResult{
 		Receipts: receipts,
