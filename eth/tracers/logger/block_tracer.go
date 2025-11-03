@@ -416,10 +416,17 @@ func (t *blockTracer) OnTxStart(env *tracing.VMContext, tx *types.Transaction, f
 		record["gasPrice"] = ToCanonicalHex(tx.GasPrice())
 	case types.AccessListTxType:
 		record["gasPrice"] = ToCanonicalHex(tx.GasPrice())
-		// TODO: Add access list serialization
+		// Serialize access list if present
+		if accessList := tx.AccessList(); len(accessList) > 0 {
+			record["accessList"] = serializeAccessList(accessList)
+		}
 	case types.DynamicFeeTxType:
 		record["maxFeePerGas"] = ToCanonicalHex(tx.GasFeeCap())
 		record["maxPriorityFeePerGas"] = ToCanonicalHex(tx.GasTipCap())
+		// EIP-2930 access lists are also supported in EIP-1559 transactions
+		if accessList := tx.AccessList(); len(accessList) > 0 {
+			record["accessList"] = serializeAccessList(accessList)
+		}
 	case types.BlobTxType:
 		record["maxFeePerGas"] = ToCanonicalHex(tx.GasFeeCap())
 		record["maxPriorityFeePerGas"] = ToCanonicalHex(tx.GasTipCap())
@@ -431,9 +438,17 @@ func (t *blockTracer) OnTxStart(env *tracing.VMContext, tx *types.Transaction, f
 			canonicalBlobHashes[i] = CanonicalHash(hash)
 		}
 		record["blobVersionedHashes"] = canonicalBlobHashes
+		// EIP-2930 access lists are also supported in blob transactions
+		if accessList := tx.AccessList(); len(accessList) > 0 {
+			record["accessList"] = serializeAccessList(accessList)
+		}
 	case types.SetCodeTxType:
 		record["maxFeePerGas"] = ToCanonicalHex(tx.GasFeeCap())
 		record["maxPriorityFeePerGas"] = ToCanonicalHex(tx.GasTipCap())
+		// EIP-2930 access lists are also supported in SetCode transactions
+		if accessList := tx.AccessList(); len(accessList) > 0 {
+			record["accessList"] = serializeAccessList(accessList)
+		}
 	}
 
 	// Remove any nil optional fields for canonical format
@@ -706,6 +721,29 @@ func toHex(n *big.Int) string {
 		return "0x0"
 	}
 	return "0x" + n.Text(16)
+}
+
+// serializeAccessList converts an EIP-2930 access list to canonical JSON format.
+// Each entry contains an address and its associated storage keys, both in lowercase hex.
+// Storage keys use minimal hex representation (leading zeros removed).
+func serializeAccessList(accessList types.AccessList) []map[string]interface{} {
+	result := make([]map[string]interface{}, len(accessList))
+	for i, tuple := range accessList {
+		entry := map[string]interface{}{
+			"address": CanonicalAddress(tuple.Address),
+		}
+
+		// Convert storage keys to canonical minimal hex (strip leading zeros)
+		storageKeys := make([]string, len(tuple.StorageKeys))
+		for j, key := range tuple.StorageKeys {
+			// Convert hash to big.Int to get minimal hex representation
+			storageKeys[j] = ToCanonicalHex(key.Big())
+		}
+		entry["storageKeys"] = storageKeys
+
+		result[i] = entry
+	}
+	return result
 }
 
 // getForkName attempts to determine the fork name from the block header.
