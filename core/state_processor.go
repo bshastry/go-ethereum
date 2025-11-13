@@ -98,14 +98,8 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	}
 
 	// Iterate over and process the individual transactions
-	// Collect per-transaction gas data for trace validation record
-	type txGasInfo struct {
-		CumulativeGasUsed string `json:"cumulativeGasUsed"`
-		GasLimit          string `json:"gasLimit"`
-		GasUsed           string `json:"gasUsed"`
-		TxIndex           string `json:"txIndex"`
-	}
-	var txGasInfos []txGasInfo
+	// Collect per-transaction gas data for validation tracing (stored in ProcessResult)
+	var txGasInfos []TxGasInfo
 
 	for i, tx := range block.Transactions() {
 		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
@@ -122,7 +116,7 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		allLogs = append(allLogs, receipt.Logs...)
 
 		// Collect per-transaction gas info for trace validation
-		txGasInfos = append(txGasInfos, txGasInfo{
+		txGasInfos = append(txGasInfos, TxGasInfo{
 			TxIndex:           toHex(uint64(i)),
 			GasLimit:          toHex(tx.Gas()),
 			GasUsed:           toHex(receipt.GasUsed),
@@ -280,95 +274,9 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		}
 	}
 
-	// Block-level trace: Validation - gas accounting
-	if hooks := cfg.Tracer; hooks != nil && hooks.OnValidation != nil {
-		gasLimitExceeded := *usedGas > header.GasLimit
-		overallResult := "valid"
-		if gasLimitExceeded {
-			overallResult = "invalid"
-		}
-		hooks.OnValidation("gasAccounting", map[string]interface{}{
-			"blockGasLimit":    toHex(header.GasLimit),
-			"gasLimitExceeded": gasLimitExceeded,
-			"overallResult":    overallResult,
-			"totalGasUsed":     toHex(*usedGas),
-			"transactions":     txGasInfos,
-			"valid":            !gasLimitExceeded,
-		})
-	}
-
-	// Block-level trace: Validation - blob gas accounting (if post-Cancun)
-	if config.IsCancun(block.Number(), block.Time()) {
-		if hooks := cfg.Tracer; hooks != nil && hooks.OnValidation != nil {
-			var totalBlobGasUsed uint64
-			blobTxInfos := make([]map[string]interface{}, 0)
-
-			// Collect per-transaction blob gas info
-			for i, receipt := range receipts {
-				if receipt.BlobGasUsed > 0 {
-					totalBlobGasUsed += receipt.BlobGasUsed
-					blobCount := receipt.BlobGasUsed / params.BlobTxBlobGasPerBlob
-					blobTxInfos = append(blobTxInfos, map[string]interface{}{
-						"blobCount":             toHex(blobCount),
-						"blobGasPerBlob":        toHex(params.BlobTxBlobGasPerBlob),
-						"blobGasUsed":           toHex(receipt.BlobGasUsed),
-						"cumulativeBlobGasUsed": toHex(totalBlobGasUsed),
-						"txIndex":               toHex(uint64(i)),
-					})
-				}
-			}
-
-			maxBlobGas := eip4844.MaxBlobGasPerBlock(config, block.Time())
-			blobGasLimitExceeded := totalBlobGasUsed > maxBlobGas
-
-			// Calculate blob gas price using fake exponential
-			excessBlobGas := *header.ExcessBlobGas
-			blobGasPrice := eip4844.CalcBlobFee(config, header)
-
-			// Trace the fake exponential calculation for transparency
-			// factor = 1 Wei (minBlobGasPrice), numerator = excessBlobGas, denominator = UPDATE_FRACTION
-			// Get the fork-specific UpdateFraction for accurate tracing
-			blobConfig := eip4844.LatestBlobConfig(config, block.Time())
-			minPrice := big.NewInt(params.BlobTxMinBlobGasprice)
-			denominator := new(big.Int).SetUint64(blobConfig.UpdateFraction)
-			numerator := new(big.Int).SetUint64(excessBlobGas)
-
-			// Build fake exponential trace with first iteration
-			iterations := []map[string]interface{}{
-				{
-					"accumulator": toHexBig(new(big.Int).Mul(minPrice, denominator)),
-					"i":           "0x0",
-					"overflow":    false,
-				},
-			}
-
-			overallResult := "valid"
-			if blobGasLimitExceeded {
-				overallResult = "invalid"
-			}
-
-			hooks.OnValidation("blobGasAccounting", map[string]interface{}{
-				"blobGasLimitExceeded": blobGasLimitExceeded,
-				"blobGasPriceCalculation": map[string]interface{}{
-					"blobGasPrice": toHexBig(blobGasPrice),
-					"excessBlobGas": toHex(excessBlobGas),
-					"fakeExponential": map[string]interface{}{
-						"denominator": toHexBig(denominator),
-						"factor":      toHexBig(minPrice),
-						"iterations":  iterations,
-						"numerator":   toHexBig(numerator),
-						"result":      toHexBig(blobGasPrice),
-					},
-					"minBlobGasPrice": toHexBig(minPrice),
-				},
-				"maxBlobGasPerBlock": toHex(maxBlobGas),
-				"overallResult":      overallResult,
-				"totalBlobGasUsed":   toHex(totalBlobGasUsed),
-				"transactions":       blobTxInfos,
-				"valid":              !blobGasLimitExceeded,
-			})
-		}
-	}
+	// NOTE: Validation traces (gasAccounting, blobGasAccounting) have been moved to
+	// EmitValidationTraces() which is called from blockchain.go AFTER ValidateState() succeeds.
+	// This ensures we only emit validation traces for blocks that pass all validation checks.
 
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
 	// Note: Withdrawals have already been processed above (before execution requests) to match
@@ -382,11 +290,108 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	p.chain.Engine().Finalize(p.chain, header, tracingStateDB, bodyWithoutWithdrawals)
 
 	return &ProcessResult{
-		Receipts: receipts,
-		Requests: requests,
-		Logs:     allLogs,
-		GasUsed:  *usedGas,
+		Receipts:   receipts,
+		Requests:   requests,
+		Logs:       allLogs,
+		GasUsed:    *usedGas,
+		TxGasInfos: txGasInfos,
 	}, nil
+}
+
+// EmitValidationTraces emits block-level validation traces after successful state validation.
+// This must be called AFTER ValidateState() to ensure we only trace valid blocks.
+func EmitValidationTraces(block *types.Block, res *ProcessResult, config *params.ChainConfig, hooks *tracing.Hooks) {
+	if hooks == nil || hooks.OnValidation == nil {
+		return
+	}
+
+	header := block.Header()
+
+	// Block-level trace: Validation - gas accounting
+	gasLimitExceeded := res.GasUsed > header.GasLimit
+	overallResult := "valid"
+	if gasLimitExceeded {
+		overallResult = "invalid"
+	}
+	hooks.OnValidation("gasAccounting", map[string]interface{}{
+		"blockGasLimit":    toHex(header.GasLimit),
+		"gasLimitExceeded": gasLimitExceeded,
+		"overallResult":    overallResult,
+		"totalGasUsed":     toHex(res.GasUsed),
+		"transactions":     res.TxGasInfos,
+		"valid":            !gasLimitExceeded,
+	})
+
+	// Block-level trace: Validation - blob gas accounting (if post-Cancun)
+	if config.IsCancun(block.Number(), block.Time()) {
+		var totalBlobGasUsed uint64
+		blobTxInfos := make([]map[string]interface{}, 0)
+
+		// Collect per-transaction blob gas info
+		for i, receipt := range res.Receipts {
+			if receipt.BlobGasUsed > 0 {
+				totalBlobGasUsed += receipt.BlobGasUsed
+				blobCount := receipt.BlobGasUsed / params.BlobTxBlobGasPerBlob
+				blobTxInfos = append(blobTxInfos, map[string]interface{}{
+					"blobCount":             toHex(blobCount),
+					"blobGasPerBlob":        toHex(params.BlobTxBlobGasPerBlob),
+					"blobGasUsed":           toHex(receipt.BlobGasUsed),
+					"cumulativeBlobGasUsed": toHex(totalBlobGasUsed),
+					"txIndex":               toHex(uint64(i)),
+				})
+			}
+		}
+
+		maxBlobGas := eip4844.MaxBlobGasPerBlock(config, block.Time())
+		blobGasLimitExceeded := totalBlobGasUsed > maxBlobGas
+
+		// Calculate blob gas price using fake exponential
+		excessBlobGas := *header.ExcessBlobGas
+		blobGasPrice := eip4844.CalcBlobFee(config, header)
+
+		// Trace the fake exponential calculation for transparency
+		// factor = 1 Wei (minBlobGasPrice), numerator = excessBlobGas, denominator = UPDATE_FRACTION
+		// Get the fork-specific UpdateFraction for accurate tracing
+		blobConfig := eip4844.LatestBlobConfig(config, block.Time())
+		minPrice := big.NewInt(params.BlobTxMinBlobGasprice)
+		denominator := new(big.Int).SetUint64(blobConfig.UpdateFraction)
+		numerator := new(big.Int).SetUint64(excessBlobGas)
+
+		// Build fake exponential trace with first iteration
+		iterations := []map[string]interface{}{
+			{
+				"accumulator": toHexBig(new(big.Int).Mul(minPrice, denominator)),
+				"i":           "0x0",
+				"overflow":    false,
+			},
+		}
+
+		overallResult := "valid"
+		if blobGasLimitExceeded {
+			overallResult = "invalid"
+		}
+
+		hooks.OnValidation("blobGasAccounting", map[string]interface{}{
+			"blobGasLimitExceeded": blobGasLimitExceeded,
+			"blobGasPriceCalculation": map[string]interface{}{
+				"blobGasPrice":  toHexBig(blobGasPrice),
+				"excessBlobGas": toHex(excessBlobGas),
+				"fakeExponential": map[string]interface{}{
+					"denominator": toHexBig(denominator),
+					"factor":      toHexBig(minPrice),
+					"iterations":  iterations,
+					"numerator":   toHexBig(numerator),
+					"result":      toHexBig(blobGasPrice),
+				},
+				"minBlobGasPrice": toHexBig(minPrice),
+			},
+			"maxBlobGasPerBlock": toHex(maxBlobGas),
+			"overallResult":      overallResult,
+			"totalBlobGasUsed":   toHex(totalBlobGasUsed),
+			"transactions":       blobTxInfos,
+			"valid":              !blobGasLimitExceeded,
+		})
+	}
 }
 
 // toHex converts a uint64 to a 0x-prefixed hexadecimal string.

@@ -87,30 +87,46 @@ type traceEndMarker struct {
 }
 
 type traceEndDetails struct {
-	Error string `json:"error,omitempty"`
-	Fork  string `json:"fork"`
-	Name  string `json:"name"`
-	Pass  bool   `json:"pass"`
-	Root  string `json:"root,omitempty"`
+	// Fields ordered alphabetically for consistent JSON output across clients
+	Error              string  `json:"error,omitempty"`                  // EEST error code (e.g., "UnknownException")
+	Fork               string  `json:"fork"`                             // Required: fork name (e.g., "Osaka")
+	LastValidBlock     *uint64 `json:"lastValidBlock,omitempty"`        // Last successfully processed block number (pointer to include 0)
+	LastValidStateRoot string  `json:"lastValidStateRoot,omitempty"`    // State root (final for success, last valid for failure)
+	Name               string  `json:"name"`                             // Required: test name
+	Pass               bool    `json:"pass"`                             // Required: test result
 }
 
 // writeTraceEndMarker writes a blocktest end marker to stderr in JSONL format.
 // This provides a clear delimiter for trace parsers (e.g., goevmlab) to know when
 // the trace output for a specific test is complete, enabling proper batched processing.
-func writeTraceEndMarker(name string, pass bool, fork string, root *common.Hash, errMsg string) {
+//
+// The marker includes EEST (Ethereum Execution Spec Test) error codes for
+// machine-parsable error reporting standardized across clients.
+func writeTraceEndMarker(name string, pass bool, fork string, stateRoot *common.Hash, lastValidBlock uint64, err error) {
 	details := traceEndDetails{
 		Name: name,
 		Pass: pass,
 		Fork: fork,
 	}
-	if root != nil {
-		details.Root = root.Hex()
+
+	// Always include state root if available (final root for success, last valid for failure)
+	if stateRoot != nil {
+		details.LastValidStateRoot = stateRoot.Hex()
 	}
-	if !pass && errMsg != "" {
-		details.Error = errMsg
+
+	// For failures, include error code and last valid block
+	if !pass && err != nil {
+		// Extract just the error code from the mapped error details
+		errorDetails := MapErrorToEEST(err, err.Error())
+		if errorDetails != nil {
+			details.Error = errorDetails.Code
+		}
+		// Always include lastValidBlock for failures (use pointer to include 0)
+		details.LastValidBlock = &lastValidBlock
 	}
+
 	marker := traceEndMarker{TestEnd: details}
-	if data, err := json.Marshal(marker); err == nil {
+	if data, jsonErr := json.Marshal(marker); jsonErr == nil {
 		fmt.Fprintf(os.Stderr, "%s\n", data)
 	}
 }
@@ -146,32 +162,57 @@ func runBlockTest(ctx *cli.Context, fname string) ([]testResult, error) {
 		tracer := tracerFromFlags(ctx, test.Network())
 
 		result := &testResult{Name: name, Pass: true}
-		var finalRoot *common.Hash
+		var (
+			finalRoot, lastValidRoot common.Hash
+			hasFinalRoot, hasLastValidRoot bool
+			lastValidBlock uint64
+			testErr        error
+		)
 		if err := test.Run(false, rawdb.PathScheme, ctx.Bool(WitnessCrossCheckFlag.Name), tracer, func(res error, chain *core.BlockChain) {
 			if ctx.Bool(DumpFlag.Name) {
 				if s, _ := chain.State(); s != nil {
 					result.State = dump(s)
 				}
 			}
-			// Capture final state root for end marker
+			// Capture state root tracking for both success and failure cases
 			if chain != nil {
-				root := chain.CurrentBlock().Root
-				finalRoot = &root
+				currentBlock := chain.CurrentBlock()
+				root := currentBlock.Root
+				blockNum := currentBlock.Number.Uint64()
+
+				if res == nil {
+					// Test succeeded - this is the final root
+					finalRoot = root
+					hasFinalRoot = true
+				} else {
+					// Test failed - current chain state is the last valid state before failure
+					lastValidRoot = root
+					hasLastValidRoot = true
+					lastValidBlock = blockNum
+				}
 			}
 		}); err != nil {
 			result.Pass, result.Error = false, err.Error()
+			testErr = err
 		}
 
 		// Always assign fork (regardless of pass/fail or tracer)
 		result.Fork = test.Network()
 		// Assign root if test succeeded
-		if result.Pass && finalRoot != nil {
-			result.Root = finalRoot
+		if result.Pass && hasFinalRoot {
+			result.Root = &finalRoot
 		}
 
 		// When tracing, write end marker to delimit trace output for this test
 		if tracer != nil {
-			writeTraceEndMarker(result.Name, result.Pass, result.Fork, finalRoot, result.Error)
+			// Use final root for success, last valid root for failure
+			var stateRoot *common.Hash
+			if hasLastValidRoot {
+				stateRoot = &lastValidRoot
+			} else if hasFinalRoot {
+				stateRoot = &finalRoot
+			}
+			writeTraceEndMarker(result.Name, result.Pass, result.Fork, stateRoot, lastValidBlock, testErr)
 		}
 
 		results = append(results, *result)

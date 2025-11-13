@@ -2090,6 +2090,10 @@ func (bc *BlockChain) ProcessBlock(parentRoot common.Hash, block *types.Block, s
 	}
 	vtime := time.Since(vstart)
 
+	// Emit validation traces only after successful validation
+	// This ensures we don't trace validation for blocks that will be rejected
+	EmitValidationTraces(block, res, bc.chainConfig, bc.cfg.VmConfig.Tracer)
+
 	// If witnesses was generated and stateless self-validation requested, do
 	// that now. Self validation should *never* run in production, it's more of
 	// a tight integration to enable running *all* consensus tests through the

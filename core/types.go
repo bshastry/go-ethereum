@@ -57,4 +57,14 @@ type ProcessResult struct {
 	Requests [][]byte
 	Logs     []*types.Log
 	GasUsed  uint64
+	// TxGasInfos contains per-transaction gas data for validation tracing
+	TxGasInfos []TxGasInfo
+}
+
+// TxGasInfo holds per-transaction gas usage data for validation tracing
+type TxGasInfo struct {
+	CumulativeGasUsed string `json:"cumulativeGasUsed"`
+	GasLimit          string `json:"gasLimit"`
+	GasUsed           string `json:"gasUsed"`
+	TxIndex           string `json:"txIndex"`
 }

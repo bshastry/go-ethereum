@@ -188,14 +188,19 @@ func (t *BlockTest) run(config *params.ChainConfig, snapshotter bool, scheme str
 	}
 	defer chain.Stop()
 
+	// Schedule post-check to run regardless of test outcome (success or failure).
+	// This captures the final/last-valid state root for trace output.
+	// Must be deferred BEFORE insertBlocks so it runs even when insertion fails.
+	// Wrapped in anonymous function to capture result at execution time, not scheduling time.
+	if postCheck != nil {
+		defer func() {
+			postCheck(result, chain)
+		}()
+	}
+
 	validBlocks, err := t.insertBlocks(chain)
 	if err != nil {
 		return err
-	}
-	// Import succeeded: regardless of whether the _test_ succeeds or not, schedule
-	// the post-check to run
-	if postCheck != nil {
-		defer postCheck(result, chain)
 	}
 	cmlast := chain.CurrentBlock().Hash()
 	if common.Hash(t.json.BestBlock) != cmlast {
