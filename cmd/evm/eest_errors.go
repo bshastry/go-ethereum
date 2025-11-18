@@ -61,7 +61,7 @@ var (
 		Message: "Block difficulty calculation incorrect",
 	}
 	ErrCodeInvalidGasLimit = EESTErrorCode{
-		Code:    "BlockException.INVALID_GAS_LIMIT",
+		Code:    "BlockException.INVALID_GASLIMIT",
 		Message: "Gas limit exceeds maximum allowed change",
 	}
 	ErrCodeInvalidStateRoot = EESTErrorCode{

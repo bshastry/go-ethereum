@@ -93,7 +93,7 @@ func TestMapErrorToEEST(t *testing.T) {
 			name:     "String-based matching for gas limit",
 			err:      nil,
 			errMsg:   "block #4 insertion into chain failed: invalid gas limit",
-			wantCode: "BlockException.INVALID_GAS_LIMIT",
+			wantCode: "BlockException.INVALID_GASLIMIT",
 		},
 		{
 			name:     "MaxInitCodeSizeExceeded core error",

@@ -259,7 +259,28 @@ See https://ethereum-tests.readthedocs.io/en/latest/blockchain-ref.html
 */
 // matchesExpectedException checks if an actual error matches an expected EEST exception code.
 // It performs lenient matching to handle variations in error message formatting.
+// Supports pipe-separated exceptions: "Exception1|Exception2" - passes if ANY match.
 func matchesExpectedException(actualErr error, expectedCode string) bool {
+	if actualErr == nil || expectedCode == "" {
+		return false
+	}
+
+	// Handle pipe-separated exceptions: "BlockException.A|BlockException.B"
+	// Test passes if actual error matches ANY of the expected exceptions
+	exceptions := strings.Split(expectedCode, "|")
+	for _, exc := range exceptions {
+		exc = strings.TrimSpace(exc)
+		if matchesSingleException(actualErr, exc) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// matchesSingleException checks if an actual error matches a single expected exception code.
+// Internal helper function that performs the actual matching logic.
+func matchesSingleException(actualErr error, expectedCode string) bool {
 	if actualErr == nil || expectedCode == "" {
 		return false
 	}

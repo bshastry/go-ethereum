@@ -115,7 +115,7 @@ func TestComprehensiveErrorMapping(t *testing.T) {
 			category: "Block/String",
 			err:      nil,
 			errMsg:   "block #4 insertion into chain failed: invalid gas limit",
-			wantCode: "BlockException.INVALID_GAS_LIMIT",
+			wantCode: "BlockException.INVALID_GASLIMIT",
 		},
 		{
 			category: "Block/String",
