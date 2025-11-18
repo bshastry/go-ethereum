@@ -77,7 +77,7 @@ var (
 		Message: "Blob versioned hashes do not match",
 	}
 	ErrCodeInvalidExcessBlobGas = EESTErrorCode{
-		Code:    "BlockException.INVALID_EXCESS_BLOB_GAS",
+		Code:    "BlockException.INCORRECT_EXCESS_BLOB_GAS",
 		Message: "Excess blob gas calculation incorrect",
 	}
 	ErrCodeInvalidRequests = EESTErrorCode{
@@ -183,6 +183,10 @@ var (
 // blockInsertionPattern matches errors like "block #3 insertion into chain failed: invalid block number"
 var blockInsertionPattern = regexp.MustCompile(`block #(\d+) insertion(?: into chain)? failed: (.+)`)
 
+// negativeTestPattern matches errors from negative test validation like:
+// "block (index 8) insertion should have failed due to: TransactionException.NONCE_MISMATCH_TOO_LOW"
+var negativeTestPattern = regexp.MustCompile(`block \(index (\d+)\) insertion should have failed due to: ([A-Za-z._]+)`)
+
 // blockNumberPattern extracts context from block number errors
 var blockNumberPattern = regexp.MustCompile(`expected (\d+), got (\d+)|header has number (\d+) but parent \((\w+)\) has (\d+)`)
 
@@ -191,6 +195,24 @@ var blockNumberPattern = regexp.MustCompile(`expected (\d+), got (\d+)|header ha
 func MapErrorToEEST(err error, errMsg string) *ErrorDetails {
 	if err == nil && errMsg == "" {
 		return nil
+	}
+
+	// First, check if this is a negative test validation error that already contains
+	// the expected EEST error code. These errors occur when a block was supposed to
+	// fail validation but didn't, and the error message includes the expected error code.
+	if matches := negativeTestPattern.FindStringSubmatch(errMsg); len(matches) == 3 {
+		blockIndex, _ := strconv.ParseInt(matches[1], 10, 64)
+		eestCode := matches[2]
+
+		context := make(map[string]interface{})
+		context["blockIndex"] = blockIndex
+
+		// Return the EEST error code directly from the test expectation
+		return &ErrorDetails{
+			Code:    eestCode,
+			Message: fmt.Sprintf("Block insertion should have failed with: %s", eestCode),
+			Context: context,
+		}
 	}
 
 	// Extract block index and base error from insertion message

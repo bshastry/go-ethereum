@@ -26,6 +26,7 @@ import (
 	"math/big"
 	"os"
 	"reflect"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -256,6 +257,49 @@ See https://ethereum-tests.readthedocs.io/en/latest/blockchain-ref.html
 	expected we are expected to ignore it and continue processing and then validate the
 	post state.
 */
+// matchesExpectedException checks if an actual error matches an expected EEST exception code.
+// It performs lenient matching to handle variations in error message formatting.
+func matchesExpectedException(actualErr error, expectedCode string) bool {
+	if actualErr == nil || expectedCode == "" {
+		return false
+	}
+
+	actualMsg := strings.ToLower(actualErr.Error())
+	expectedLower := strings.ToLower(expectedCode)
+
+	// Direct substring match
+	if strings.Contains(actualMsg, expectedLower) {
+		return true
+	}
+
+	// Map common EEST exception codes to error message patterns
+	errorPatterns := map[string][]string{
+		"blockexception.incorrect_excess_blob_gas": {"excess blob gas", "excessblobgas", "invalid excessblobgas"},
+		"blockexception.incorrect_blob_gas_used":   {"blob gas used", "blobgasused", "invalid blob gas used"},
+		"blockexception.invalid_gaslimit":          {"gas limit", "gaslimit"},
+		"blockexception.invalid_basefee_per_gas":   {"base fee", "basefee"},
+		"blockexception.invalid_block_number":      {"block number", "invalid number"},
+		"blockexception.invalid_state_root":        {"state root", "stateroot"},
+		"blockexception.invalid_block_timestamp":   {"timestamp"},
+		"blockexception.unknown_parent":            {"unknown ancestor", "unknown parent"},
+		"transactionexception.nonce_too_low":       {"nonce too low"},
+		"transactionexception.nonce_too_high":      {"nonce too high"},
+		"transactionexception.insufficient_funds":  {"insufficient funds", "insufficient balance"},
+		"transactionexception.intrinsic_gas":       {"intrinsic gas"},
+	}
+
+	// Check if any pattern matches
+	if patterns, ok := errorPatterns[expectedLower]; ok {
+		for _, pattern := range patterns {
+			if strings.Contains(actualMsg, pattern) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func (t *BlockTest) insertBlocks(blockchain *core.BlockChain) ([]btBlock, error) {
 	validBlocks := make([]btBlock, 0)
 	// insert the test blocks, which will execute all transactions
@@ -272,6 +316,33 @@ func (t *BlockTest) insertBlocks(blockchain *core.BlockChain) ([]btBlock, error)
 		// RLP decoding worked, try to insert into chain:
 		blocks := types.Blocks{cb}
 		i, err := blockchain.InsertChain(blocks)
+
+		// Check if this block has an expected exception
+		if b.ExpectException != "" {
+			// Block is expected to fail validation
+			if err == nil {
+				// CRITICAL: Block was accepted but should have been rejected
+				if data, jsonErr := json.MarshalIndent(cb.Header(), "", "  "); jsonErr == nil {
+					fmt.Fprintf(os.Stdout, "block (index %d) insertion should have failed due to: %v:\n%v\n",
+						bi, b.ExpectException, string(data))
+				}
+				return nil, fmt.Errorf("block (index %d) insertion should have failed due to: %v",
+					bi, b.ExpectException)
+			}
+
+			// Block failed as expected - verify the error matches
+			if !matchesExpectedException(err, b.ExpectException) {
+				return nil, fmt.Errorf("block (index %d) failed with wrong error: expected %q, got %q",
+					bi, b.ExpectException, err.Error())
+			}
+
+			// Error matched expected exception - continue to next block
+			// Don't add to validBlocks since this block failed (as expected)
+			log.Info("Block correctly rejected with expected error", "index", bi, "error", b.ExpectException)
+			continue
+		}
+
+		// No expectException set - block should succeed
 		if err != nil {
 			if b.BlockHeader == nil {
 				continue // OK - block is supposed to be invalid, continue with next block
@@ -280,12 +351,12 @@ func (t *BlockTest) insertBlocks(blockchain *core.BlockChain) ([]btBlock, error)
 			}
 		}
 		if b.BlockHeader == nil {
-			if data, err := json.MarshalIndent(cb.Header(), "", "  "); err == nil {
-				fmt.Fprintf(os.Stdout, "block (index %d) insertion should have failed due to: %v:\n%v\n",
-					bi, b.ExpectException, string(data))
+			if data, jsonErr := json.MarshalIndent(cb.Header(), "", "  "); jsonErr == nil {
+				fmt.Fprintf(os.Stdout, "block (index %d) insertion should have failed but succeeded:\n%v\n",
+					bi, string(data))
 			}
-			return nil, fmt.Errorf("block (index %d) insertion should have failed due to: %v",
-				bi, b.ExpectException)
+			return nil, fmt.Errorf("block (index %d) insertion should have failed but succeeded",
+				bi)
 		}
 
 		// validate RLP decoding by checking all values against test file JSON

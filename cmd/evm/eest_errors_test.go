@@ -131,6 +131,49 @@ func TestMapErrorToEEST(t *testing.T) {
 			errMsg:   "transaction failed: fee cap less than base fee",
 			wantCode: "TransactionException.TX_FEE_CAP_LESS_THAN_BLOCKS",
 		},
+		// Test cases for "insertion should have failed" pattern (negative test validation)
+		{
+			name:        "Negative test validation: NONCE_MISMATCH_TOO_LOW",
+			err:         fmt.Errorf("block (index 8) insertion should have failed due to: TransactionException.NONCE_MISMATCH_TOO_LOW"),
+			errMsg:      "block (index 8) insertion should have failed due to: TransactionException.NONCE_MISMATCH_TOO_LOW",
+			wantCode:    "TransactionException.NONCE_MISMATCH_TOO_LOW",
+			wantContext: true,
+		},
+		{
+			name:        "Negative test validation: NONCE_TOO_LOW",
+			err:         fmt.Errorf("block (index 5) insertion should have failed due to: TransactionException.NONCE_TOO_LOW"),
+			errMsg:      "block (index 5) insertion should have failed due to: TransactionException.NONCE_TOO_LOW",
+			wantCode:    "TransactionException.NONCE_TOO_LOW",
+			wantContext: true,
+		},
+		{
+			name:        "Negative test validation: INSUFFICIENT_ACCOUNT_FUNDS",
+			err:         fmt.Errorf("block (index 3) insertion should have failed due to: TransactionException.INSUFFICIENT_ACCOUNT_FUNDS"),
+			errMsg:      "block (index 3) insertion should have failed due to: TransactionException.INSUFFICIENT_ACCOUNT_FUNDS",
+			wantCode:    "TransactionException.INSUFFICIENT_ACCOUNT_FUNDS",
+			wantContext: true,
+		},
+		{
+			name:        "Negative test validation: INVALID_BASEFEE_PER_GAS",
+			err:         fmt.Errorf("block (index 2) insertion should have failed due to: BlockException.INVALID_BASEFEE_PER_GAS"),
+			errMsg:      "block (index 2) insertion should have failed due to: BlockException.INVALID_BASEFEE_PER_GAS",
+			wantCode:    "BlockException.INVALID_BASEFEE_PER_GAS",
+			wantContext: true,
+		},
+		{
+			name:        "Negative test validation: INCORRECT_BLOB_GAS_USED",
+			err:         fmt.Errorf("block (index 1) insertion should have failed due to: BlockException.INCORRECT_BLOB_GAS_USED"),
+			errMsg:      "block (index 1) insertion should have failed due to: BlockException.INCORRECT_BLOB_GAS_USED",
+			wantCode:    "BlockException.INCORRECT_BLOB_GAS_USED",
+			wantContext: true,
+		},
+		{
+			name:        "Negative test validation: INVALID_BLOCK_NUMBER",
+			err:         fmt.Errorf("block (index 0) insertion should have failed due to: BlockException.INVALID_BLOCK_NUMBER"),
+			errMsg:      "block (index 0) insertion should have failed due to: BlockException.INVALID_BLOCK_NUMBER",
+			wantCode:    "BlockException.INVALID_BLOCK_NUMBER",
+			wantContext: true,
+		},
 	}
 
 	for _, tt := range tests {
