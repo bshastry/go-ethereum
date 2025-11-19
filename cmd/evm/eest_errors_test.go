@@ -96,6 +96,12 @@ func TestMapErrorToEEST(t *testing.T) {
 			wantCode: "BlockException.INVALID_GASLIMIT",
 		},
 		{
+			name:     "String-based matching for invalid basefee",
+			err:      nil,
+			errMsg:   "block #2 insertion into chain failed: invalid baseFee: have 7, want 8, parentBaseFee 7, parentGasUsed 161029410",
+			wantCode: "BlockException.INVALID_BASEFEE_PER_GAS",
+		},
+		{
 			name:     "MaxInitCodeSizeExceeded core error",
 			err:      core.ErrMaxInitCodeSizeExceeded,
 			errMsg:   "transaction failed: max initcode size exceeded",

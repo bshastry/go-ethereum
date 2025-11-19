@@ -301,8 +301,9 @@ func matchesSingleException(actualErr error, expectedCode string) bool {
 		"blockexception.invalid_basefee_per_gas":   {"base fee", "basefee"},
 		"blockexception.invalid_block_number":      {"block number", "invalid number"},
 		"blockexception.invalid_state_root":        {"state root", "stateroot"},
-		"blockexception.invalid_block_timestamp":   {"timestamp"},
-		"blockexception.unknown_parent":            {"unknown ancestor", "unknown parent"},
+		"blockexception.invalid_block_timestamp":                  {"timestamp"},
+		"blockexception.invalid_block_timestamp_older_than_parent": {"invalid timestamp"},
+		"blockexception.unknown_parent":                            {"unknown ancestor", "unknown parent"},
 		"transactionexception.nonce_too_low":       {"nonce too low"},
 		"transactionexception.nonce_too_high":      {"nonce too high"},
 		"transactionexception.insufficient_funds":  {"insufficient funds", "insufficient balance"},
@@ -327,6 +328,17 @@ func (t *BlockTest) insertBlocks(blockchain *core.BlockChain) ([]btBlock, error)
 	for bi, b := range t.json.Blocks {
 		cb, err := b.decode()
 		if err != nil {
+			// Check if this block has an expected exception for decode errors
+			if b.ExpectException != "" {
+				// Block expected to fail - verify the error matches
+				if !matchesExpectedException(err, b.ExpectException) {
+					return nil, fmt.Errorf("block (index %d) RLP decode failed with wrong error: expected %q, got %q",
+						bi, b.ExpectException, err.Error())
+				}
+				// Error matched expected exception - continue to next block
+				log.Info("Block correctly rejected with expected error during decode", "index", bi, "error", b.ExpectException)
+				continue
+			}
 			if b.BlockHeader == nil {
 				log.Info("Block decoding failed", "index", bi, "err", err)
 				continue // OK - block is supposed to be invalid, continue with next block

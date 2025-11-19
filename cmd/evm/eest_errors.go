@@ -84,6 +84,10 @@ var (
 		Code:    "BlockException.INVALID_REQUESTS",
 		Message: "EIP-7685 requests root does not match",
 	}
+	ErrCodeInvalidBaseFee = EESTErrorCode{
+		Code:    "BlockException.INVALID_BASEFEE_PER_GAS",
+		Message: "Block base fee does not match expected calculation",
+	}
 	ErrCodeUnknownAncestor = EESTErrorCode{
 		Code:    "BlockException.UNKNOWN_PARENT",
 		Message: "Parent block not found in chain",
@@ -338,6 +342,9 @@ func matchErrorByString(baseErr, fullMsg string) EESTErrorCode {
 
 	case strings.Contains(errStr, "requests"):
 		return ErrCodeInvalidRequests
+
+	case strings.Contains(errStr, "invalid basefee") || strings.Contains(errStr, "invalid base fee"):
+		return ErrCodeInvalidBaseFee
 
 	case strings.Contains(errStr, "unknown ancestor") || strings.Contains(errStr, "unknown parent"):
 		return ErrCodeUnknownAncestor
