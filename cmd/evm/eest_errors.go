@@ -64,6 +64,10 @@ var (
 		Code:    "BlockException.INVALID_GASLIMIT",
 		Message: "Gas limit exceeds maximum allowed change",
 	}
+	ErrCodeGasLimitTooBig = EESTErrorCode{
+		Code:    "BlockException.GASLIMIT_TOO_BIG",
+		Message: "Gas limit exceeds maximum value (0x7fffffffffffffff)",
+	}
 	ErrCodeInvalidStateRoot = EESTErrorCode{
 		Code:    "BlockException.INVALID_STATE_ROOT",
 		Message: "State root does not match computed value",
@@ -325,7 +329,11 @@ func matchErrorByString(baseErr, fullMsg string) EESTErrorCode {
 	case strings.Contains(errStr, "difficulty"):
 		return ErrCodeInvalidDifficulty
 
-	case strings.Contains(errStr, "gas limit") && strings.Contains(errStr, "invalid"):
+	case strings.Contains(errStr, "gas limit") || strings.Contains(errStr, "gaslimit"):
+		// Distinguish between GASLIMIT_TOO_BIG (exceeds max) and INVALID_GASLIMIT (bounds check)
+		if strings.Contains(errStr, "max") {
+			return ErrCodeGasLimitTooBig
+		}
 		return ErrCodeInvalidGasLimit
 
 	case strings.Contains(errStr, "state root") || strings.Contains(errStr, "stateroot"):
