@@ -75,6 +75,11 @@ func LoadSeedsFromFiles(paths []string) ([][]byte, error) {
 	return seeds, nil
 }
 
+// IsValidStateTestJSON checks if the data looks like a valid state test (exported)
+func IsValidStateTestJSON(data []byte) bool {
+	return isValidStateTestJSON(data)
+}
+
 // isValidStateTestJSON checks if the data looks like a valid state test
 func isValidStateTestJSON(data []byte) bool {
 	// Quick check: must be valid JSON

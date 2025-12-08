@@ -383,6 +383,144 @@ Crashes are automatically saved to `testdata/crashes/`:
 - `crash_N.json`: The input that caused the crash
 - `fuzz_crashes.log`: Log of all crashes with timestamps
 
+## Standalone Trace Tool
+
+The `statetest-trace` CLI tool processes a corpus of state tests and produces enhanced output with embedded trace hashes for cross-client differential testing.
+
+### Installation
+
+```bash
+go build -o statetest-trace ./tests/fuzzers/statetest/cmd/statetest-trace/
+```
+
+### Quick Start
+
+```bash
+# Process a corpus directory
+./statetest-trace process ./corpus ./enhanced_corpus
+
+# Process with progress reporting and 16 workers
+./statetest-trace process -w 16 -p ./corpus ./enhanced_corpus
+
+# Dry run (validate without writing)
+./statetest-trace process --dry-run ./corpus ./enhanced_corpus
+
+# Verify an existing enhanced corpus
+./statetest-trace verify ./enhanced_corpus
+
+# Dump trace for a single test (debugging)
+./statetest-trace dump ./test.json
+
+# Show corpus statistics
+./statetest-trace stats ./enhanced_corpus
+```
+
+### Subcommands
+
+#### `process` - Process a corpus
+
+Reads state tests from the input directory, executes them with trace normalization, and writes enhanced tests to the output directory.
+
+```bash
+statetest-trace process [flags] <input-dir> <output-dir>
+
+Flags:
+  -w, --workers int       Number of parallel workers (default: NumCPU)
+  -t, --timeout duration  Timeout per test (default: 30s)
+  -f, --fork string       Only process tests for specific fork
+  -p, --progress          Show progress bar
+      --skip-invalid      Skip invalid tests instead of erroring
+  -q, --quiet             Suppress non-error output
+  -v, --verbose           Show each processed file
+      --dry-run           Validate without writing output
+      --overwrite         Overwrite existing output files
+```
+
+#### `verify` - Verify trace hashes
+
+Re-executes tests and compares computed trace hashes against stored values.
+
+```bash
+statetest-trace verify [flags] <corpus-dir>
+
+Flags:
+  -w, --workers int       Number of parallel workers
+  -t, --timeout duration  Timeout per test (default: 30s)
+  -v, --verbose           Show each verified file
+  -q, --quiet             Suppress non-error output
+```
+
+#### `dump` - Dump normalized trace
+
+Outputs the normalized trace for a single test in JSONL format.
+
+```bash
+statetest-trace dump [flags] <test-file>
+
+Flags:
+  -o, --output string     Output file path (default: stdout)
+      --include-filtered  Include filtered entries (STOP, depth=0)
+  -t, --timeout duration  Timeout (default: 30s)
+```
+
+#### `stats` - Show corpus statistics
+
+Analyzes a corpus and reports statistics.
+
+```bash
+statetest-trace stats [flags] <corpus-dir>
+
+Flags:
+      --json   Output in JSON format
+  -q, --quiet  Suppress output
+```
+
+### Output Format
+
+The tool produces enhanced test files with embedded metadata:
+
+```json
+{
+  "testName_d0g0v0": {
+    "_info": {
+      "comment": "Cross-VM consensus verification test",
+      "generatedBy": "geth",
+      "traceHash": "13251158d97ea2420d51501e32f818fc",
+      "stateRoot": "0x60a3fe53c5486f7967c947766fce4e08...",
+      "crossvmVersion": "1.0",
+      "traceLines": 42,
+      "generatedAt": "2025-12-08T10:00:00Z",
+      "version": "dev"
+    },
+    "env": {...},
+    "pre": {...},
+    "transaction": {...},
+    "post": {...}
+  }
+}
+```
+
+### Output Directory Structure
+
+```
+output_dir/
+├── manifest.json           # Summary of processed tests
+├── errors.log              # Any errors encountered
+└── tests/
+    ├── <tracehash1>.json
+    ├── <tracehash2>.json
+    └── ...
+```
+
+### Integration with Cross-Client Testing
+
+1. **Generate enhanced corpus** with `statetest-trace process`
+2. **Share corpus** with other client implementations
+3. **Other clients verify** by re-executing and comparing trace hashes
+4. **Detect divergences** when trace hashes don't match
+
+See `STANDALONE_TRACE_TOOL_PLAN.md` for detailed design documentation.
+
 ## Credits
 
 Based on the custom mutator fuzzer from [goevmlab](https://github.com/holiman/goevmlab) by Martin Holst Swende, with enhancements for coverage-guided prioritization.
