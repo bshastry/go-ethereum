@@ -18,6 +18,7 @@ package statetest
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"time"
@@ -181,4 +182,107 @@ func executeWithTracing(
 // ExecuteAndNormalize is the public API for executing with trace normalization
 func ExecuteAndNormalize(testJSON []byte, timeout time.Duration) (*TracingResult, error) {
 	return executeWithTracing(context.Background(), testJSON, timeout)
+}
+
+// DumpTraceConfig holds configuration for trace dumping
+type DumpTraceConfig struct {
+	OutputPath      string // Path to write the trace dump (JSONL)
+	IncludeFiltered bool   // Whether to include filtered entries
+	Fork            string // Fork name for metadata (auto-detected if empty)
+	TestName        string // Test name for metadata (auto-detected if empty)
+}
+
+// ExecuteAndDumpTrace executes a state test and dumps the normalized trace to a file.
+// This is used for debugging cross-VM divergences.
+func ExecuteAndDumpTrace(testJSON []byte, timeout time.Duration, config *DumpTraceConfig) (*TracingResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var stateTests map[string]tests.StateTest
+	if err := json.Unmarshal(testJSON, &stateTests); err != nil {
+		return nil, err
+	}
+
+	// Create dump writer
+	dumpWriter, err := NewFileDumpTraceWriter(config.OutputPath, config.IncludeFiltered)
+	if err != nil {
+		return nil, err
+	}
+	defer dumpWriter.Close()
+
+	// Compute input hash for metadata
+	inputHashBytes := md5.Sum(testJSON)
+	inputHash := hex.EncodeToString(inputHashBytes[:])
+
+	// Create normalizer with dump writer
+	normalizer := NewTraceNormalizerWithDump(dumpWriter)
+
+	// Auto-detect fork and test name if not provided
+	fork := config.Fork
+	testName := config.TestName
+	for name, test := range stateTests {
+		if testName == "" {
+			testName = name
+		}
+		for _, subtest := range test.Subtests() {
+			if fork == "" {
+				fork = subtest.Fork
+			}
+			break
+		}
+		break
+	}
+
+	// Write metadata header
+	meta := CreateTraceDumpMeta(fork, inputHash, testName)
+	dumpWriter.WriteMeta(meta)
+
+	tracer := &normalizingTracer{
+		ctx:           ctx,
+		normalizer:    normalizer,
+		checkInterval: 100,
+	}
+
+	var result TracingResult
+
+	// Execute with panic recovery
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if !isCancellationError(r) {
+					panic(r)
+				}
+			}
+		}()
+
+		for _, test := range stateTests {
+			for _, subtest := range test.Subtests() {
+				if !isSupportedFork(subtest.Fork) {
+					continue
+				}
+
+				st, root, _, err := test.RunNoVerify(
+					subtest,
+					vm.Config{Tracer: tracer.Hooks()},
+					false,
+					rawdb.HashScheme,
+				)
+				if err == nil {
+					result.StateRoot = root.Hex()
+				}
+
+				if st.StateDB != nil {
+					st.Close()
+				}
+			}
+		}
+	}()
+
+	// Finalize and get trace hash (with dump output)
+	hashBytes := normalizer.FinishWithStateRootAndDump(result.StateRoot)
+	result.TraceHash = hex.EncodeToString(hashBytes)
+	result.TraceLines = normalizer.Lines()
+	result.GasUsed = tracer.GasUsed()
+
+	return &result, nil
 }

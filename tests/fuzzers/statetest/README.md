@@ -291,6 +291,85 @@ Other Ethereum clients can participate in cross-VM differential testing by:
 4. Verifying entries from other clients instead of mutating them
 5. Saving discovered inputs with `"generatedBy": "clientname"`
 
+## Trace Dump Mode (Debug)
+
+When investigating cross-VM divergences, you can dump normalized traces to files for manual comparison with other clients.
+
+### Usage (Programmatic)
+
+```go
+import "github.com/ethereum/go-ethereum/tests/fuzzers/statetest"
+
+config := &statetest.DumpTraceConfig{
+    OutputPath:      "geth_trace.jsonl",
+    IncludeFiltered: true,  // Include filtered entries (STOP, depth=0, duplicates)
+}
+result, err := statetest.ExecuteAndDumpTrace(testJSON, 5*time.Second, config)
+```
+
+### Output Format (JSONL)
+
+```jsonl
+{"_meta":{"client":"geth","version":"dev","fork":"London","inputHash":"abc123...","testName":"Test_d0g0v0","timestamp":"2025-12-08T12:00:00Z","normalizerVersion":"1"}}
+{"depth":1,"pc":0,"gas":100000000,"op":"0x60","opName":"PUSH1","stack":[]}
+{"depth":1,"pc":2,"gas":99999997,"op":"0x01","opName":"ADD","stack":["0x1"]}
+{"_filtered":{"reason":"STOP_OPCODE","depth":1,"pc":100,"op":"0x00","opName":"STOP"}}
+{"stateRoot":"0x123..."}
+{"_result":{"traceHash":"abc123...","traceLines":42,"finalLineHash":"xyz789..."}}
+```
+
+### Metadata Fields (`_meta`)
+
+| Field | Description |
+|-------|-------------|
+| `client` | Client name ("geth") |
+| `version` | Client version string |
+| `fork` | Ethereum fork name (London, Paris, Prague, etc.) |
+| `inputHash` | MD5 hash of input test JSON |
+| `testName` | Name of the specific subtest |
+| `timestamp` | ISO 8601 timestamp |
+| `normalizerVersion` | Version of normalizer algorithm (currently "1") |
+
+### Filter Reason Codes (`_filtered`)
+
+| Code | Description |
+|------|-------------|
+| `STOP_OPCODE` | STOP opcode (0x00) filtered |
+| `DEPTH_ZERO` | depth=0 entry filtered (pre-execution) |
+| `DUPLICATE` | Duplicate PC+depth+functionDepth entry filtered |
+
+### Result Fields (`_result`)
+
+| Field | Description |
+|-------|-------------|
+| `traceHash` | MD5 hash of all trace lines + stateRoot |
+| `traceLines` | Number of trace lines included in hash |
+| `finalLineHash` | MD5 hash of just the last line (helps identify where divergence occurred) |
+
+### Comparing Traces Between Clients
+
+```bash
+# Generate traces with both clients
+./geth-statetest --dump-trace=geth_trace.jsonl test.json
+./besu-evmtool state-test --dump-trace=besu_trace.jsonl test.json
+
+# Quick diff (ignoring metadata lines)
+diff <(grep -v '_meta\|_result' geth_trace.jsonl) <(grep -v '_meta\|_result' besu_trace.jsonl)
+
+# Find first divergent line
+diff geth_trace.jsonl besu_trace.jsonl | head -20
+```
+
+### Implementing Trace Dump in Other Clients
+
+To participate in cross-VM debugging:
+
+1. Implement the `--dump-trace=<path>` flag
+2. Output JSONL format with the same field order
+3. Include `_meta` header with normalizer version
+4. Optionally support `--dump-filtered` for filtered entry logging
+5. Include `_result` footer with traceHash and finalLineHash
+
 ## Performance
 
 Typical performance on a modern machine:

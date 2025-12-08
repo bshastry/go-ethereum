@@ -18,13 +18,281 @@ package statetest
 
 import (
 	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"hash"
+	"io"
+	"os"
+	"runtime/debug"
 	"strconv"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/holiman/uint256"
 )
+
+// FilterReason describes why a trace line was filtered out
+type FilterReason string
+
+const (
+	FilterReasonStopOpcode FilterReason = "STOP_OPCODE"
+	FilterReasonDepthZero  FilterReason = "DEPTH_ZERO"
+	FilterReasonDuplicate  FilterReason = "DUPLICATE"
+)
+
+// TraceDumpMeta contains metadata for trace dump files (JSONL header)
+type TraceDumpMeta struct {
+	Client            string `json:"client"`
+	Version           string `json:"version"`
+	Fork              string `json:"fork"`
+	InputHash         string `json:"inputHash"`
+	TestName          string `json:"testName"`
+	Timestamp         string `json:"timestamp"`
+	NormalizerVersion string `json:"normalizerVersion"`
+}
+
+// TraceDumpFiltered represents a filtered trace entry
+type TraceDumpFiltered struct {
+	Reason        FilterReason `json:"reason"`
+	Depth         int          `json:"depth"`
+	Pc            uint64       `json:"pc"`
+	Op            string       `json:"op"`
+	OpName        string       `json:"opName"`
+	FunctionDepth int          `json:"functionDepth,omitempty"`
+}
+
+// TraceDumpResult contains the final result summary for trace dump
+type TraceDumpResult struct {
+	TraceHash     string `json:"traceHash"`
+	TraceLines    int    `json:"traceLines"`
+	FinalLineHash string `json:"finalLineHash"`
+}
+
+// DumpTraceWriter is an interface for writing trace lines during normalization.
+// This is used for debugging cross-VM divergences by dumping normalized traces.
+type DumpTraceWriter interface {
+	// WriteMeta writes the metadata header (first line of JSONL output)
+	WriteMeta(meta *TraceDumpMeta) error
+	// WriteTraceLine writes a normalized trace line
+	WriteTraceLine(log *CanonicalOpLog) error
+	// WriteFiltered writes a filtered entry (when --dump-filtered is enabled)
+	WriteFiltered(reason FilterReason, log *CanonicalOpLog) error
+	// WriteStateRoot writes the stateRoot line
+	WriteStateRoot(stateRoot string) error
+	// WriteResult writes the final result summary
+	WriteResult(result *TraceDumpResult) error
+	// Close closes the writer
+	Close() error
+}
+
+// FileDumpTraceWriter writes trace dump to a file in JSONL format
+type FileDumpTraceWriter struct {
+	file         *os.File
+	includeFiltered bool
+}
+
+// NewFileDumpTraceWriter creates a new file-based trace dump writer
+func NewFileDumpTraceWriter(path string, includeFiltered bool) (*FileDumpTraceWriter, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return &FileDumpTraceWriter{
+		file:            f,
+		includeFiltered: includeFiltered,
+	}, nil
+}
+
+func (w *FileDumpTraceWriter) writeLine(data []byte) error {
+	_, err := w.file.Write(data)
+	if err != nil {
+		return err
+	}
+	_, err = w.file.Write([]byte{'\n'})
+	return err
+}
+
+// WriteMeta writes the metadata header
+func (w *FileDumpTraceWriter) WriteMeta(meta *TraceDumpMeta) error {
+	wrapper := map[string]*TraceDumpMeta{"_meta": meta}
+	data, err := json.Marshal(wrapper)
+	if err != nil {
+		return err
+	}
+	return w.writeLine(data)
+}
+
+// WriteTraceLine writes a normalized trace line
+func (w *FileDumpTraceWriter) WriteTraceLine(log *CanonicalOpLog) error {
+	data := canonicalMarshal(log)
+	return w.writeLine(data)
+}
+
+// WriteFiltered writes a filtered entry
+func (w *FileDumpTraceWriter) WriteFiltered(reason FilterReason, log *CanonicalOpLog) error {
+	if !w.includeFiltered {
+		return nil
+	}
+	filtered := TraceDumpFiltered{
+		Reason:        reason,
+		Depth:         log.Depth,
+		Pc:            log.Pc,
+		Op:            "0x" + strconv.FormatUint(uint64(log.Op), 16),
+		OpName:        log.OpName,
+		FunctionDepth: log.FunctionDepth,
+	}
+	wrapper := map[string]*TraceDumpFiltered{"_filtered": &filtered}
+	data, err := json.Marshal(wrapper)
+	if err != nil {
+		return err
+	}
+	return w.writeLine(data)
+}
+
+// WriteStateRoot writes the stateRoot line
+func (w *FileDumpTraceWriter) WriteStateRoot(stateRoot string) error {
+	data := []byte(`{"stateRoot":"` + stateRoot + `"}`)
+	return w.writeLine(data)
+}
+
+// WriteResult writes the final result summary
+func (w *FileDumpTraceWriter) WriteResult(result *TraceDumpResult) error {
+	wrapper := map[string]*TraceDumpResult{"_result": result}
+	data, err := json.Marshal(wrapper)
+	if err != nil {
+		return err
+	}
+	return w.writeLine(data)
+}
+
+// Close closes the file
+func (w *FileDumpTraceWriter) Close() error {
+	return w.file.Close()
+}
+
+// NullDumpTraceWriter is a no-op writer for when dumping is disabled
+type NullDumpTraceWriter struct{}
+
+func (w *NullDumpTraceWriter) WriteMeta(meta *TraceDumpMeta) error                          { return nil }
+func (w *NullDumpTraceWriter) WriteTraceLine(log *CanonicalOpLog) error                     { return nil }
+func (w *NullDumpTraceWriter) WriteFiltered(reason FilterReason, log *CanonicalOpLog) error { return nil }
+func (w *NullDumpTraceWriter) WriteStateRoot(stateRoot string) error                        { return nil }
+func (w *NullDumpTraceWriter) WriteResult(result *TraceDumpResult) error                    { return nil }
+func (w *NullDumpTraceWriter) Close() error                                                 { return nil }
+
+// StreamDumpTraceWriter writes trace dump to any io.Writer
+type StreamDumpTraceWriter struct {
+	writer          io.Writer
+	includeFiltered bool
+}
+
+// NewStreamDumpTraceWriter creates a new stream-based trace dump writer
+func NewStreamDumpTraceWriter(w io.Writer, includeFiltered bool) *StreamDumpTraceWriter {
+	return &StreamDumpTraceWriter{
+		writer:          w,
+		includeFiltered: includeFiltered,
+	}
+}
+
+func (w *StreamDumpTraceWriter) writeLine(data []byte) error {
+	_, err := w.writer.Write(data)
+	if err != nil {
+		return err
+	}
+	_, err = w.writer.Write([]byte{'\n'})
+	return err
+}
+
+// WriteMeta writes the metadata header
+func (w *StreamDumpTraceWriter) WriteMeta(meta *TraceDumpMeta) error {
+	wrapper := map[string]*TraceDumpMeta{"_meta": meta}
+	data, err := json.Marshal(wrapper)
+	if err != nil {
+		return err
+	}
+	return w.writeLine(data)
+}
+
+// WriteTraceLine writes a normalized trace line
+func (w *StreamDumpTraceWriter) WriteTraceLine(log *CanonicalOpLog) error {
+	data := canonicalMarshal(log)
+	return w.writeLine(data)
+}
+
+// WriteFiltered writes a filtered entry
+func (w *StreamDumpTraceWriter) WriteFiltered(reason FilterReason, log *CanonicalOpLog) error {
+	if !w.includeFiltered {
+		return nil
+	}
+	filtered := TraceDumpFiltered{
+		Reason:        reason,
+		Depth:         log.Depth,
+		Pc:            log.Pc,
+		Op:            "0x" + strconv.FormatUint(uint64(log.Op), 16),
+		OpName:        log.OpName,
+		FunctionDepth: log.FunctionDepth,
+	}
+	wrapper := map[string]*TraceDumpFiltered{"_filtered": &filtered}
+	data, err := json.Marshal(wrapper)
+	if err != nil {
+		return err
+	}
+	return w.writeLine(data)
+}
+
+// WriteStateRoot writes the stateRoot line
+func (w *StreamDumpTraceWriter) WriteStateRoot(stateRoot string) error {
+	data := []byte(`{"stateRoot":"` + stateRoot + `"}`)
+	return w.writeLine(data)
+}
+
+// WriteResult writes the final result summary
+func (w *StreamDumpTraceWriter) WriteResult(result *TraceDumpResult) error {
+	wrapper := map[string]*TraceDumpResult{"_result": result}
+	data, err := json.Marshal(wrapper)
+	if err != nil {
+		return err
+	}
+	return w.writeLine(data)
+}
+
+// Close is a no-op for stream writers (caller owns the stream)
+func (w *StreamDumpTraceWriter) Close() error {
+	return nil
+}
+
+// getGethVersionForNormalizer returns the geth version string
+func getGethVersionForNormalizer() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	if info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "vcs.revision" {
+			if len(setting.Value) > 8 {
+				return setting.Value[:8]
+			}
+			return setting.Value
+		}
+	}
+	return "dev"
+}
+
+// CreateTraceDumpMeta creates metadata for a trace dump
+func CreateTraceDumpMeta(fork, inputHash, testName string) *TraceDumpMeta {
+	return &TraceDumpMeta{
+		Client:            "geth",
+		Version:           getGethVersionForNormalizer(),
+		Fork:              fork,
+		InputHash:         inputHash,
+		TestName:          testName,
+		Timestamp:         time.Now().UTC().Format(time.RFC3339),
+		NormalizerVersion: "1",
+	}
+}
 
 // CanonicalOpLog represents a normalized EVM execution step.
 // This format strips client-specific quirks for cross-client comparison.
@@ -76,15 +344,31 @@ func (lch *lineCountingHasher) Reset() {
 // It processes trace lines, filters out noise, and produces a
 // deterministic hash for cross-client comparison.
 type TraceNormalizer struct {
-	hasher *lineCountingHasher
-	prev   *CanonicalOpLog // For geth error line merging
+	hasher     *lineCountingHasher
+	prev       *CanonicalOpLog   // For geth error line merging
+	dumpWriter DumpTraceWriter   // Optional dump writer for debugging
+	lastLine   []byte            // Track last line for finalLineHash
 }
 
 // NewTraceNormalizer creates a new normalizer
 func NewTraceNormalizer() *TraceNormalizer {
 	return &TraceNormalizer{
-		hasher: newLineCountingHasher(),
+		hasher:     newLineCountingHasher(),
+		dumpWriter: &NullDumpTraceWriter{},
 	}
+}
+
+// NewTraceNormalizerWithDump creates a normalizer with trace dumping enabled
+func NewTraceNormalizerWithDump(writer DumpTraceWriter) *TraceNormalizer {
+	return &TraceNormalizer{
+		hasher:     newLineCountingHasher(),
+		dumpWriter: writer,
+	}
+}
+
+// SetDumpWriter sets the dump writer (can be called after creation)
+func (n *TraceNormalizer) SetDumpWriter(writer DumpTraceWriter) {
+	n.dumpWriter = writer
 }
 
 // ProcessLine normalizes a single trace line (JSON format)
@@ -101,11 +385,13 @@ func (n *TraceNormalizer) ProcessLine(line []byte) error {
 func (n *TraceNormalizer) ProcessLog(log *CanonicalOpLog) error {
 	// Filter: depth=0 means not a real opcode
 	if log.Depth == 0 {
+		n.dumpWriter.WriteFiltered(FilterReasonDepthZero, log)
 		return nil
 	}
 
 	// Filter: STOP opcodes at end (geth continues on virtual STOP)
 	if log.Op == 0x00 { // STOP
+		n.dumpWriter.WriteFiltered(FilterReasonStopOpcode, log)
 		return nil
 	}
 
@@ -114,6 +400,7 @@ func (n *TraceNormalizer) ProcessLog(log *CanonicalOpLog) error {
 	if n.prev != nil {
 		if n.prev.Pc == log.Pc && n.prev.Depth == log.Depth && n.prev.FunctionDepth == log.FunctionDepth {
 			// Skip this line, it's a duplicate
+			n.dumpWriter.WriteFiltered(FilterReasonDuplicate, log)
 			return nil
 		}
 		// Flush previous log
@@ -129,6 +416,8 @@ func (n *TraceNormalizer) ProcessLog(log *CanonicalOpLog) error {
 func (n *TraceNormalizer) writeNormalized(log *CanonicalOpLog) {
 	data := canonicalMarshal(log)
 	n.hasher.WriteLine(data)
+	n.lastLine = data
+	n.dumpWriter.WriteTraceLine(log)
 }
 
 // Finish flushes remaining data and returns the hash
@@ -151,8 +440,31 @@ func (n *TraceNormalizer) FinishWithStateRoot(stateRoot string) []byte {
 	if stateRoot != "" {
 		stateRootJSON := `{"stateRoot":"` + stateRoot + `"}`
 		n.hasher.WriteLine([]byte(stateRootJSON))
+		n.lastLine = []byte(stateRootJSON)
+		n.dumpWriter.WriteStateRoot(stateRoot)
 	}
 	return n.hasher.Sum()
+}
+
+// FinishWithStateRootAndDump finishes normalization and writes the result summary to dump writer
+func (n *TraceNormalizer) FinishWithStateRootAndDump(stateRoot string) []byte {
+	hash := n.FinishWithStateRoot(stateRoot)
+
+	// Compute finalLineHash (MD5 of just the last line)
+	finalLineHash := ""
+	if len(n.lastLine) > 0 {
+		h := md5.Sum(n.lastLine)
+		finalLineHash = hex.EncodeToString(h[:])
+	}
+
+	// Write result summary
+	n.dumpWriter.WriteResult(&TraceDumpResult{
+		TraceHash:     hex.EncodeToString(hash),
+		TraceLines:    n.hasher.lines,
+		FinalLineHash: finalLineHash,
+	})
+
+	return hash
 }
 
 // Lines returns the number of trace lines processed
@@ -164,6 +476,7 @@ func (n *TraceNormalizer) Lines() int {
 func (n *TraceNormalizer) Reset() {
 	n.hasher.Reset()
 	n.prev = nil
+	n.lastLine = nil
 }
 
 // canonicalMarshal produces deterministic JSON output for an oplog.
