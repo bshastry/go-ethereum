@@ -72,15 +72,13 @@ func (t *normalizingTracer) Hooks() *tracing.Hooks {
 			// Track gas usage
 			t.gasUsed += cost
 
-			// Build canonical log entry
+			// Build canonical log entry (minimal fields for cross-client comparison)
 			log := &CanonicalOpLog{
-				Depth:      depth,
-				Pc:         pc,
-				Gas:        gas,
-				Op:         op,
-				OpName:     vm.OpCode(op).String(),
-				GasCost:    cost,
-				MemorySize: len(scope.MemoryData()),
+				Depth:  depth,
+				Pc:     pc,
+				Gas:    gas,
+				Op:     op,
+				OpName: vm.OpCode(op).String(),
 			}
 
 			// Capture stack (last 6 items for determinism)
@@ -97,26 +95,21 @@ func (t *normalizingTracer) Hooks() *tracing.Hooks {
 				}
 			}
 
-			// Capture return data if present
-			if len(rData) > 0 {
-				log.ReturnData = make([]byte, len(rData))
-				copy(log.ReturnData, rData)
-			}
-
-			// Capture error
-			if err != nil {
-				log.Error = err.Error()
-			}
-
 			// Feed to normalizer
 			t.normalizer.ProcessLog(log)
 		},
 	}
 }
 
-// Finish completes tracing and returns the normalized hash
+// Finish completes tracing and returns the normalized hash (without stateRoot)
 func (t *normalizingTracer) Finish() (hash []byte, lines int) {
 	return t.normalizer.Finish(), t.normalizer.Lines()
+}
+
+// FinishWithStateRoot completes tracing, includes stateRoot in hash, and returns the hash.
+// This matches goevmlab's behavior where hash = MD5(trace_lines + stateRoot_line)
+func (t *normalizingTracer) FinishWithStateRoot(stateRoot string) (hash []byte, lines int) {
+	return t.normalizer.FinishWithStateRoot(stateRoot), t.normalizer.Lines()
 }
 
 // GasUsed returns the total gas consumed
@@ -176,8 +169,8 @@ func executeWithTracing(
 		}
 	}()
 
-	// Finalize and get trace hash
-	hashBytes, lines := tracer.Finish()
+	// Finalize and get trace hash (includes stateRoot in hash for cross-client comparison)
+	hashBytes, lines := tracer.FinishWithStateRoot(result.StateRoot)
 	result.TraceHash = hex.EncodeToString(hashBytes)
 	result.TraceLines = lines
 	result.GasUsed = tracer.GasUsed()

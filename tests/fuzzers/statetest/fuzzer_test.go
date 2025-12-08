@@ -37,11 +37,13 @@ import (
 
 // FuzzStats tracks fuzzer statistics
 type FuzzStats struct {
-	totalExecs    int64
-	totalCrashes  int64
-	totalTimeouts int64
-	coverageFinds int64
-	corpusSaved   int64
+	totalExecs      int64
+	totalCrashes    int64
+	totalTimeouts   int64
+	coverageFinds   int64
+	corpusSaved     int64
+	crossVMVerified int64 // Cross-VM entries verified
+	crossVMFailed   int64 // Cross-VM entries that failed verification (consensus divergence!)
 
 	startTime    time.Time
 	numWorkers   int
@@ -74,6 +76,33 @@ func (s *FuzzStats) logCrash(input []byte, panicVal interface{}) {
 		time.Now().Format(time.RFC3339), crashID, panicVal)
 
 	f, err := os.OpenFile(filepath.Join(s.crashDir, s.crashLogFile),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString(logEntry)
+}
+
+// logCrossVMDivergence logs a cross-VM consensus divergence
+func (s *FuzzStats) logCrossVMDivergence(input []byte, expectedHash, actualHash, sourceVM string) {
+	atomic.AddInt64(&s.crossVMFailed, 1)
+
+	s.crashMu.Lock()
+	defer s.crashMu.Unlock()
+
+	// Save divergence input
+	divergeID := atomic.LoadInt64(&s.crossVMFailed)
+	divergeFile := filepath.Join(s.crashDir, fmt.Sprintf("divergence_%d.json", divergeID))
+	if err := os.WriteFile(divergeFile, input, 0644); err != nil {
+		return
+	}
+
+	// Append to divergence log
+	logEntry := fmt.Sprintf("[%s] CONSENSUS DIVERGENCE #%d: source=%s expected=%s actual=%s\n",
+		time.Now().Format(time.RFC3339), divergeID, sourceVM, expectedHash, actualHash)
+
+	f, err := os.OpenFile(filepath.Join(s.crashDir, "crossvm_divergences.log"),
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
@@ -205,8 +234,16 @@ func worker(
 			continue
 		}
 
-		// Strip stale fuzzer metadata before mutation to avoid stale hashes
-		cleaned, err := StripFuzzerMetadata(input)
+		// Check if this is a cross-VM entry that needs verification
+		crossVMMeta := extractCrossVMMetadata(input)
+		if crossVMMeta != nil && crossVMMeta.GeneratedBy != "" && crossVMMeta.GeneratedBy != "geth" {
+			// Cross-VM entry from another client - verify instead of mutate
+			verifyCrossVMEntry(input, crossVMMeta, stats, testTimeout)
+			continue
+		}
+
+		// Strip stale metadata before mutation to avoid stale hashes
+		cleaned, err := StripCrossVMMetadata(input)
 		if err != nil {
 			cleaned = input
 		}
@@ -263,6 +300,43 @@ func worker(
 				ParentStrategy: strategyName,
 			})
 		}
+	}
+}
+
+// extractCrossVMMetadata extracts cross-VM metadata from a test JSON if present
+func extractCrossVMMetadata(testJSON []byte) *CrossVMMetadata {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(testJSON, &raw); err != nil {
+		return nil
+	}
+
+	crossvmRaw, ok := raw["_crossvm"]
+	if !ok {
+		return nil
+	}
+
+	var meta CrossVMMetadata
+	if err := json.Unmarshal(crossvmRaw, &meta); err != nil {
+		return nil
+	}
+	return &meta
+}
+
+// verifyCrossVMEntry verifies a cross-VM corpus entry and logs divergences
+func verifyCrossVMEntry(input []byte, meta *CrossVMMetadata, stats *FuzzStats, timeout time.Duration) {
+	// Execute with trace normalization
+	result, err := ExecuteAndNormalize(input, timeout)
+	if err != nil {
+		// Execution failed - can't verify
+		return
+	}
+
+	atomic.AddInt64(&stats.crossVMVerified, 1)
+
+	// Compare trace hashes
+	if result.TraceHash != meta.TraceHash {
+		// CONSENSUS DIVERGENCE DETECTED!
+		stats.logCrossVMDivergence(input, meta.TraceHash, result.TraceHash, meta.GeneratedBy)
 	}
 }
 
@@ -379,6 +453,8 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 			hpLen, spLen, _, _ := corpus.Stats()
 
 			corpusSaved := atomic.LoadInt64(&stats.corpusSaved)
+			crossVMVerified := atomic.LoadInt64(&stats.crossVMVerified)
+			crossVMFailed := atomic.LoadInt64(&stats.crossVMFailed)
 
 			t.Logf("")
 			t.Logf("═══════════════════════════════════════════════════════════════════")
@@ -391,6 +467,9 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 				currentCov, covFinds, sinceLastFind, growthRate)
 			t.Logf(" QUEUE: %d  CORPUS: %d  SAVED: %d",
 				hpLen, spLen, corpusSaved)
+			if crossVMVerified > 0 || crossVMFailed > 0 {
+				t.Logf(" CROSS-VM: verified=%d  divergences=%d", crossVMVerified, crossVMFailed)
+			}
 			t.Logf("═══════════════════════════════════════════════════════════════════")
 
 		case <-stats.done:
@@ -407,6 +486,8 @@ func printFinalReport(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 	timeouts := atomic.LoadInt64(&stats.totalTimeouts)
 	covFinds := atomic.LoadInt64(&stats.coverageFinds)
 	corpusSaved := atomic.LoadInt64(&stats.corpusSaved)
+	crossVMVerified := atomic.LoadInt64(&stats.crossVMVerified)
+	crossVMFailed := atomic.LoadInt64(&stats.crossVMFailed)
 	rate := float64(execs) / elapsed.Seconds()
 	currentCov := testing.Coverage() * 100
 
@@ -428,18 +509,30 @@ func printFinalReport(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 	t.Logf("╠═══════════════════════════════════════════════════════════════════╣")
 	t.Logf("║ Crashes found:   %-48d ║", crashes)
 	t.Logf("║ Timeouts:        %-48d ║", timeouts)
+	if crossVMVerified > 0 || crossVMFailed > 0 {
+		t.Logf("╠═══════════════════════════════════════════════════════════════════╣")
+		t.Logf("║ Cross-VM verified: %-46d ║", crossVMVerified)
+		t.Logf("║ Cross-VM diverged: %-46d ║", crossVMFailed)
+	}
 	t.Logf("╚═══════════════════════════════════════════════════════════════════╝")
 
 	if crashes > 0 {
 		t.Logf("")
-		t.Logf("⚠️  Crash files saved to: %s", stats.crashDir)
-		t.Logf("⚠️  Crash log: %s", filepath.Join(stats.crashDir, stats.crashLogFile))
+		t.Logf("Crash files saved to: %s", stats.crashDir)
+		t.Logf("Crash log: %s", filepath.Join(stats.crashDir, stats.crashLogFile))
+	}
+
+	if crossVMFailed > 0 {
+		t.Logf("")
+		t.Logf("CONSENSUS DIVERGENCES DETECTED!")
+		t.Logf("Divergence files saved to: %s", stats.crashDir)
+		t.Logf("Divergence log: %s", filepath.Join(stats.crashDir, "crossvm_divergences.log"))
 	}
 
 	// Coverage guidance effectiveness
 	if covFinds > 0 {
 		t.Logf("")
-		t.Logf("📊 Coverage guidance stats:")
+		t.Logf("Coverage guidance stats:")
 		t.Logf("   - Avg execs per find: %.0f", float64(execs)/float64(covFinds))
 		if execs > 1000000 {
 			t.Logf("   - Coverage per 1M execs: %.3f%%", currentCov/(float64(execs)/1000000))

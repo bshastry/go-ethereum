@@ -25,17 +25,21 @@ import (
 	"time"
 )
 
-// FuzzerMetadata contains cross-client verification data
-type FuzzerMetadata struct {
-	GethTraceHash  string  `json:"gethTraceHash"`    // MD5 hash of normalized geth trace (for cross-VM comparison)
-	StateRoot      string  `json:"stateRoot"`        // Expected post-state root
-	TraceLines     int     `json:"traceLines"`       // Number of trace lines
-	GasUsed        uint64  `json:"gasUsed"`          // Gas consumed
-	GethVersion    string  `json:"gethVersion"`      // Geth version used
-	GeneratedAt    string  `json:"generatedAt"`      // ISO timestamp
-	CoverageDelta  float64 `json:"coverageDelta"`    // Coverage improvement
-	MutationStrat  string  `json:"mutationStrategy"` // Which strategy created this
+// CrossVMMetadata contains cross-client verification data.
+// This format is designed for 6-VM differential testing:
+// geth, nethermind, besu, erigon, revm, evmone
+//
+// When a VM loads a corpus entry with _crossvm metadata from another VM,
+// it should execute the test without mutation and verify the trace hash matches.
+type CrossVMMetadata struct {
+	TraceHash   string `json:"traceHash"`   // MD5 hash of normalized trace + stateRoot (cross-VM comparable)
+	StateRoot   string `json:"stateRoot"`   // Expected post-state root (for quick pre-check)
+	TraceLines  int    `json:"traceLines"`  // Number of trace lines
+	GeneratedBy string `json:"generatedBy"` // Which VM generated this (geth, nethermind, besu, erigon, revm, evmone)
+	Version     string `json:"version"`     // VM version
+	GeneratedAt string `json:"generatedAt"` // ISO timestamp
 }
+
 
 // CorpusSaver handles saving coverage-finding inputs with trace metadata
 type CorpusSaver struct {
@@ -56,7 +60,7 @@ func NewCorpusSaver(corpusDir string) (*CorpusSaver, error) {
 	}, nil
 }
 
-// SaveEnhancedCorpusEntry saves a state test with embedded trace hash
+// SaveEnhancedCorpusEntry saves a state test with embedded cross-VM metadata
 func (cs *CorpusSaver) SaveEnhancedCorpusEntry(
 	testJSON []byte,
 	traceResult *TracingResult,
@@ -69,23 +73,21 @@ func (cs *CorpusSaver) SaveEnhancedCorpusEntry(
 		return "", fmt.Errorf("failed to parse test JSON: %w", err)
 	}
 
-	// Add fuzzer metadata
-	meta := &FuzzerMetadata{
-		GethTraceHash: traceResult.TraceHash,
-		StateRoot:     traceResult.StateRoot,
-		TraceLines:    traceResult.TraceLines,
-		GasUsed:       traceResult.GasUsed,
-		GethVersion:   cs.gethVersion,
-		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
-		CoverageDelta: coverageDelta,
-		MutationStrat: strategyName,
+	// Add cross-VM metadata (generalized for 6-VM differential testing)
+	meta := &CrossVMMetadata{
+		TraceHash:   traceResult.TraceHash,
+		StateRoot:   traceResult.StateRoot,
+		TraceLines:  traceResult.TraceLines,
+		GeneratedBy: "geth",
+		Version:     cs.gethVersion,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
 	metaJSON, err := json.Marshal(meta)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal metadata: %w", err)
 	}
-	original["_fuzzer"] = metaJSON
+	original["_crossvm"] = metaJSON
 
 	// Generate filename from trace hash (first 16 chars for uniqueness)
 	filename := fmt.Sprintf("%s.json", traceResult.TraceHash[:16])
@@ -152,7 +154,7 @@ func getGethVersion() string {
 	return "dev"
 }
 
-// LoadEnhancedCorpus loads corpus entries with their fuzzer metadata
+// LoadEnhancedCorpus loads corpus entries with their cross-VM metadata
 func LoadEnhancedCorpus(corpusDir string) ([]EnhancedCorpusEntry, error) {
 	var entries []EnhancedCorpusEntry
 
@@ -179,10 +181,10 @@ func LoadEnhancedCorpus(corpusDir string) ([]EnhancedCorpusEntry, error) {
 			TestRaw: data,
 		}
 
-		// Extract fuzzer metadata if present
-		if fuzzerRaw, ok := raw["_fuzzer"]; ok {
-			var meta FuzzerMetadata
-			if err := json.Unmarshal(fuzzerRaw, &meta); err == nil {
+		// Extract cross-VM metadata if present
+		if crossvmRaw, ok := raw["_crossvm"]; ok {
+			var meta CrossVMMetadata
+			if err := json.Unmarshal(crossvmRaw, &meta); err == nil {
 				entry.Metadata = &meta
 			}
 		}
@@ -194,42 +196,59 @@ func LoadEnhancedCorpus(corpusDir string) ([]EnhancedCorpusEntry, error) {
 	return entries, err
 }
 
-// EnhancedCorpusEntry represents a corpus entry with optional metadata
+// EnhancedCorpusEntry represents a corpus entry with optional cross-VM metadata
 type EnhancedCorpusEntry struct {
-	Path     string          // File path
-	TestRaw  []byte          // Raw test JSON
-	Metadata *FuzzerMetadata // Optional fuzzer metadata
+	Path     string           // File path
+	TestRaw  []byte           // Raw test JSON
+	Metadata *CrossVMMetadata // Optional cross-VM metadata
 }
 
-// HasMetadata returns true if this entry has fuzzer metadata
+// HasMetadata returns true if this entry has cross-VM metadata
 func (e *EnhancedCorpusEntry) HasMetadata() bool {
 	return e.Metadata != nil
 }
 
-// GetTraceHash returns the geth trace hash if available
+// GetTraceHash returns the trace hash if available
 func (e *EnhancedCorpusEntry) GetTraceHash() string {
 	if e.Metadata != nil {
-		return e.Metadata.GethTraceHash
+		return e.Metadata.TraceHash
 	}
 	return ""
 }
 
-// VerifyAgainstTrace verifies if a new trace matches the expected geth trace hash
+// GetGeneratedBy returns which VM generated this entry
+func (e *EnhancedCorpusEntry) GetGeneratedBy() string {
+	if e.Metadata != nil {
+		return e.Metadata.GeneratedBy
+	}
+	return ""
+}
+
+// IsCrossVMEntry returns true if this entry was generated by a different VM
+func (e *EnhancedCorpusEntry) IsCrossVMEntry(currentVM string) bool {
+	if e.Metadata == nil {
+		return false
+	}
+	return e.Metadata.GeneratedBy != "" && e.Metadata.GeneratedBy != currentVM
+}
+
+// VerifyAgainstTrace verifies if a new trace matches the expected trace hash
 func (e *EnhancedCorpusEntry) VerifyAgainstTrace(newTraceHash string) bool {
 	if e.Metadata == nil {
 		return false // Can't verify without metadata
 	}
-	return e.Metadata.GethTraceHash == newTraceHash
+	return e.Metadata.TraceHash == newTraceHash
 }
 
-// StripFuzzerMetadata returns the test JSON without fuzzer metadata
-func StripFuzzerMetadata(testJSON []byte) ([]byte, error) {
+// StripCrossVMMetadata returns the test JSON without cross-VM metadata
+func StripCrossVMMetadata(testJSON []byte) ([]byte, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(testJSON, &raw); err != nil {
 		return nil, err
 	}
 
-	delete(raw, "_fuzzer")
+	delete(raw, "_crossvm")
 
 	return json.Marshal(raw)
 }
+

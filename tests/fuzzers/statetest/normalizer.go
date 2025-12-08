@@ -28,6 +28,8 @@ import (
 
 // CanonicalOpLog represents a normalized EVM execution step.
 // This format strips client-specific quirks for cross-client comparison.
+// Matches goevmlab's CustomMarshal format with ClearGascost=true, ClearMemSize=true,
+// ClearReturndata=true (the defaults used for cross-client comparison).
 type CanonicalOpLog struct {
 	Depth         int            `json:"depth"`
 	Pc            uint64         `json:"pc"`
@@ -36,11 +38,7 @@ type CanonicalOpLog struct {
 	Gas           uint64         `json:"gas"`
 	Op            byte           `json:"op"`
 	OpName        string         `json:"opName"`
-	GasCost       uint64         `json:"gasCost"`
-	MemorySize    int            `json:"memorySize"`
 	Stack         []*uint256.Int `json:"stack"` // Last 6 items only
-	ReturnData    []byte         `json:"returnData,omitempty"`
-	Error         string         `json:"error,omitempty"`
 }
 
 // lineCountingHasher wraps an MD5 hasher with line counting
@@ -111,14 +109,10 @@ func (n *TraceNormalizer) ProcessLog(log *CanonicalOpLog) error {
 		return nil
 	}
 
-	// Handle geth error line merging (same PC+depth = merge)
+	// Handle geth duplicate line merging (same PC+depth+functionDepth = merge)
 	// Geth sometimes outputs two lines for the same opcode when there's an error
 	if n.prev != nil {
-		if n.prev.Pc == log.Pc && n.prev.Depth == log.Depth {
-			// Merge error info from this line into previous
-			if log.Error != "" && n.prev.Error == "" {
-				n.prev.Error = log.Error
-			}
+		if n.prev.Pc == log.Pc && n.prev.Depth == log.Depth && n.prev.FunctionDepth == log.FunctionDepth {
 			// Skip this line, it's a duplicate
 			return nil
 		}
@@ -146,6 +140,21 @@ func (n *TraceNormalizer) Finish() []byte {
 	return n.hasher.Sum()
 }
 
+// FinishWithStateRoot flushes remaining data, adds stateRoot as final line, and returns the hash.
+// This matches goevmlab's behavior where stateRoot is included in the hash.
+func (n *TraceNormalizer) FinishWithStateRoot(stateRoot string) []byte {
+	if n.prev != nil {
+		n.writeNormalized(n.prev)
+		n.prev = nil
+	}
+	// Write stateRoot as final line (matches goevmlab format)
+	if stateRoot != "" {
+		stateRootJSON := `{"stateRoot":"` + stateRoot + `"}`
+		n.hasher.WriteLine([]byte(stateRootJSON))
+	}
+	return n.hasher.Sum()
+}
+
 // Lines returns the number of trace lines processed
 func (n *TraceNormalizer) Lines() int {
 	return n.hasher.lines
@@ -158,12 +167,13 @@ func (n *TraceNormalizer) Reset() {
 }
 
 // canonicalMarshal produces deterministic JSON output for an oplog.
-// This mirrors goevmlab's CustomMarshal but is cleaner and more maintainable.
+// This mirrors goevmlab's CustomMarshal with default settings:
+// ClearGascost=true, ClearMemSize=true, ClearReturndata=true
 // Field order is fixed for deterministic hashing.
 func canonicalMarshal(log *CanonicalOpLog) []byte {
-	b := make([]byte, 0, 256)
+	b := make([]byte, 0, 200)
 
-	// Fixed field order for deterministic output
+	// Fixed field order for deterministic output (matches goevmlab)
 	b = append(b, `{"depth":`...)
 	b = strconv.AppendInt(b, int64(log.Depth), 10)
 
@@ -196,12 +206,6 @@ func canonicalMarshal(log *CanonicalOpLog) []byte {
 	b = append(b, vm.OpCode(log.Op).String()...)
 	b = append(b, '"')
 
-	b = append(b, `,"gasCost":`...)
-	b = strconv.AppendUint(b, log.GasCost, 10)
-
-	b = append(b, `,"memorySize":`...)
-	b = strconv.AppendInt(b, int64(log.MemorySize), 10)
-
 	// Stack: last 6 items only for deterministic comparison
 	b = append(b, `,"stack":[`...)
 	if len(log.Stack) > 0 {
@@ -223,29 +227,6 @@ func canonicalMarshal(log *CanonicalOpLog) []byte {
 		}
 	}
 	b = append(b, ']')
-
-	// Error field (omit if empty)
-	if log.Error != "" {
-		b = append(b, `,"error":"`...)
-		// Escape special characters in error message
-		for _, c := range log.Error {
-			switch c {
-			case '"':
-				b = append(b, `\"`...)
-			case '\\':
-				b = append(b, `\\`...)
-			case '\n':
-				b = append(b, `\n`...)
-			case '\r':
-				b = append(b, `\r`...)
-			case '\t':
-				b = append(b, `\t`...)
-			default:
-				b = append(b, byte(c))
-			}
-		}
-		b = append(b, '"')
-	}
 
 	b = append(b, '}')
 	return b
