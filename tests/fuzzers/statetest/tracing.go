@@ -153,15 +153,15 @@ func executeWithTracing(
 					continue
 				}
 
-				st, root, _, err := test.RunNoVerify(
+				st, root, _, _ := test.RunNoVerify(
 					subtest,
 					vm.Config{Tracer: tracer.Hooks()},
 					false,
 					rawdb.HashScheme,
 				)
-				if err == nil {
-					result.StateRoot = root.Hex()
-				}
+				// Always capture stateRoot - even on validation failure, root contains
+				// the pre-state root which is needed for deterministic trace hashing
+				result.StateRoot = root.Hex()
 
 				if st.StateDB != nil {
 					st.Close()
@@ -261,15 +261,15 @@ func ExecuteAndDumpTrace(testJSON []byte, timeout time.Duration, config *DumpTra
 					continue
 				}
 
-				st, root, _, err := test.RunNoVerify(
+				st, root, _, _ := test.RunNoVerify(
 					subtest,
 					vm.Config{Tracer: tracer.Hooks()},
 					false,
 					rawdb.HashScheme,
 				)
-				if err == nil {
-					result.StateRoot = root.Hex()
-				}
+				// Always capture stateRoot - even on validation failure, root contains
+				// the pre-state root which is needed for deterministic trace hashing
+				result.StateRoot = root.Hex()
 
 				if st.StateDB != nil {
 					st.Close()
