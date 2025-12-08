@@ -41,6 +41,7 @@ type FuzzStats struct {
 	totalCrashes  int64
 	totalTimeouts int64
 	coverageFinds int64
+	corpusSaved   int64
 
 	startTime    time.Time
 	numWorkers   int
@@ -90,10 +91,11 @@ func (s *FuzzStats) logCrash(input []byte, panicVal interface{}) {
 //
 // Environment variables:
 //
-//	FUZZ_DURATION: How long to run (default: 2m)
-//	FUZZ_SEED_DIR: Seed directory (default: testdata/seeds)
-//	FUZZ_WORKERS:  Number of workers (default: NumCPU)
-//	FUZZ_STRATEGY: Mutation strategy (default: combined)
+//	FUZZ_DURATION:   How long to run (default: 2m)
+//	FUZZ_SEED_DIR:   Seed directory (default: testdata/seeds)
+//	FUZZ_WORKERS:    Number of workers (default: NumCPU)
+//	FUZZ_STRATEGY:   Mutation strategy (default: combined)
+//	FUZZ_CORPUS_DIR: Output corpus directory for trace-enhanced entries (default: testdata/enhanced_corpus)
 func TestFuzzStateTestCustomMutator(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping custom mutator fuzz test in short mode")
@@ -102,6 +104,7 @@ func TestFuzzStateTestCustomMutator(t *testing.T) {
 	// Configuration from environment
 	seedDir := getEnvOrDefault("FUZZ_SEED_DIR", filepath.Join("testdata", "seeds"))
 	strategy := getEnvOrDefault("FUZZ_STRATEGY", "combined")
+	corpusDir := getEnvOrDefault("FUZZ_CORPUS_DIR", filepath.Join("testdata", "enhanced_corpus"))
 	duration := parseDurationOrDefault("FUZZ_DURATION", 2*time.Minute)
 	numWorkers := parseIntOrDefault("FUZZ_WORKERS", runtime.NumCPU())
 	testTimeout := 5 * time.Second
@@ -118,12 +121,19 @@ func TestFuzzStateTestCustomMutator(t *testing.T) {
 		seeds = EmbeddedSeeds()
 	}
 
+	// Initialize corpus saver for trace-enhanced entries
+	corpusSaver, err := NewCorpusSaver(corpusDir)
+	if err != nil {
+		t.Fatalf("Failed to create corpus saver: %v", err)
+	}
+
 	t.Logf("Configuration:")
-	t.Logf("  Seeds:    %d", len(seeds))
-	t.Logf("  Strategy: %s", strategy)
-	t.Logf("  Duration: %v", duration)
-	t.Logf("  Workers:  %d", numWorkers)
-	t.Logf("  Timeout:  %v per test", testTimeout)
+	t.Logf("  Seeds:      %d", len(seeds))
+	t.Logf("  Strategy:   %s", strategy)
+	t.Logf("  Duration:   %v", duration)
+	t.Logf("  Workers:    %d", numWorkers)
+	t.Logf("  Timeout:    %v per test", testTimeout)
+	t.Logf("  Corpus Dir: %s", corpusDir)
 
 	// Initialize corpus with coverage guidance
 	corpus := NewCoverageCorpus(seeds,
@@ -154,7 +164,7 @@ func TestFuzzStateTestCustomMutator(t *testing.T) {
 		wg.Add(1)
 		// Each worker gets its own mutator (rand.Rand is not thread-safe)
 		workerMutator := mutations.NewRawMutatorWithCorpus(strategy, corpus)
-		go worker(i, corpus, workerMutator, &wg, stats, testTimeout)
+		go worker(i, corpus, workerMutator, &wg, stats, testTimeout, corpusSaver)
 	}
 
 	// Progress reporter
@@ -177,6 +187,7 @@ func worker(
 	wg *sync.WaitGroup,
 	stats *FuzzStats,
 	testTimeout time.Duration,
+	corpusSaver *CorpusSaver,
 ) {
 	defer wg.Done()
 
@@ -194,10 +205,16 @@ func worker(
 			continue
 		}
 
-		// Mutate
-		mutated, strategyName, err := mutator.MutateRawJSON(input)
+		// Strip stale fuzzer metadata before mutation to avoid stale hashes
+		cleaned, err := StripFuzzerMetadata(input)
 		if err != nil {
-			mutated = input
+			cleaned = input
+		}
+
+		// Mutate clean input
+		mutated, strategyName, err := mutator.MutateRawJSON(cleaned)
+		if err != nil {
+			mutated = cleaned
 			strategyName = "original"
 		}
 
@@ -221,6 +238,23 @@ func worker(
 		if coverageDelta > 0 {
 			atomic.AddInt64(&stats.coverageFinds, 1)
 			stats.lastFindTime.Store(time.Now())
+
+			// Get trace hash for cross-client comparison
+			tracingResult, tracingErr := ExecuteAndNormalize(mutated, testTimeout)
+			if tracingErr == nil && tracingResult != nil {
+				// Save enhanced corpus entry with trace metadata
+				_, saveErr := corpusSaver.SaveEnhancedCorpusEntry(
+					mutated,
+					tracingResult,
+					coverageDelta,
+					strategyName,
+				)
+				if saveErr == nil {
+					atomic.AddInt64(&stats.corpusSaved, 1)
+				}
+			}
+
+			// Add to high priority queue for further mutation
 			corpus.AddHighPriority(&PriorityInput{
 				Data:           mutated,
 				Priority:       int(coverageDelta * 1000000), // Scale for int comparison
@@ -344,6 +378,8 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 			// Corpus stats
 			hpLen, spLen, _, _ := corpus.Stats()
 
+			corpusSaved := atomic.LoadInt64(&stats.corpusSaved)
+
 			t.Logf("")
 			t.Logf("═══════════════════════════════════════════════════════════════════")
 			t.Logf(" RUNTIME: %-12s  WORKERS: %-4d  STRATEGY: %s",
@@ -353,8 +389,8 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 				execs, rate, crashes, timeouts)
 			t.Logf(" COV:  %.3f%%  FINDS: %d  LAST: %s  GROWTH: %+.4f%%/min",
 				currentCov, covFinds, sinceLastFind, growthRate)
-			t.Logf(" QUEUE: %d  CORPUS: %d",
-				hpLen, spLen)
+			t.Logf(" QUEUE: %d  CORPUS: %d  SAVED: %d",
+				hpLen, spLen, corpusSaved)
 			t.Logf("═══════════════════════════════════════════════════════════════════")
 
 		case <-stats.done:
@@ -370,6 +406,7 @@ func printFinalReport(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 	crashes := atomic.LoadInt64(&stats.totalCrashes)
 	timeouts := atomic.LoadInt64(&stats.totalTimeouts)
 	covFinds := atomic.LoadInt64(&stats.coverageFinds)
+	corpusSaved := atomic.LoadInt64(&stats.corpusSaved)
 	rate := float64(execs) / elapsed.Seconds()
 	currentCov := testing.Coverage() * 100
 
@@ -387,6 +424,7 @@ func printFinalReport(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 	t.Logf("║ Coverage finds:  %-48d ║", covFinds)
 	t.Logf("║ Corpus size:     %-48d ║", spLen)
 	t.Logf("║ Queue depth:     %-48d ║", hpLen)
+	t.Logf("║ Corpus saved:    %-48d ║", corpusSaved)
 	t.Logf("╠═══════════════════════════════════════════════════════════════════╣")
 	t.Logf("║ Crashes found:   %-48d ║", crashes)
 	t.Logf("║ Timeouts:        %-48d ║", timeouts)

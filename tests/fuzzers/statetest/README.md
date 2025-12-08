@@ -39,6 +39,7 @@ FUZZ_DURATION=24h FUZZ_WORKERS=32 go test -cover -run=TestFuzzStateTestCustomMut
 | `FUZZ_WORKERS` | `NumCPU` | Number of parallel workers |
 | `FUZZ_SEED_DIR` | `testdata/seeds` | Directory containing seed JSON files |
 | `FUZZ_STRATEGY` | `combined` | Mutation strategy to use |
+| `FUZZ_CORPUS_DIR` | `testdata/enhanced_corpus` | Output directory for trace-enhanced corpus entries |
 
 ## Mutation Strategies
 
@@ -100,13 +101,15 @@ FUZZ_STRATEGY=combined go test -cover -run=TestFuzzStateTestCustomMutator -v ./t
 │  │  │ Worker Loop:                                                        │││
 │  │  │  1. Pop input from priority queue                                   │││
 │  │  │  2. Get current coverage: before := testing.Coverage()              │││
-│  │  │  3. Mutate input (using RawMutator + SplicingStrategy)              │││
+│  │  │  3. Strip stale _fuzzer metadata, then mutate input                 │││
 │  │  │  4. Execute with timeout via cancellationTracer                     │││
 │  │  │  5. Get new coverage: after := testing.Coverage()                   │││
 │  │  │  6. If after > before:                                              │││
+│  │  │     - Generate trace hash via ExecuteAndNormalize                   │││
+│  │  │     - Save enhanced corpus entry with gethTraceHash                 │││
 │  │  │     - Add mutated input to HIGH priority queue                      │││
 │  │  │     - Add to splicing corpus                                        │││
-│  │  │  7. Record stats (execs, crashes, timeouts, coverage)               │││
+│  │  │  7. Record stats (execs, crashes, timeouts, coverage, saved)        │││
 │  │  └─────────────────────────────────────────────────────────────────────┘││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │                                                                              │
@@ -127,7 +130,7 @@ FUZZ_STRATEGY=combined go test -cover -run=TestFuzzStateTestCustomMutator -v ./t
 ───────────────────────────────────────────────────────────────────
  EXEC: 186005 (6197/s)  CRASH: 0  TIMEOUT: 0
  COV:  31.646%  FINDS: 31  LAST: 27s  GROWTH: +0.0000%/min
- QUEUE: 0  CORPUS: 31
+ QUEUE: 0  CORPUS: 31  SAVED: 31
 ═══════════════════════════════════════════════════════════════════
 
 ╔═══════════════════════════════════════════════════════════════════╗
@@ -144,6 +147,7 @@ FUZZ_STRATEGY=combined go test -cover -run=TestFuzzStateTestCustomMutator -v ./t
 ╠═══════════════════════════════════════════════════════════════════╣
 ║ Crashes found:   0                                                ║
 ║ Timeouts:        0                                                ║
+║ Corpus saved:    31                                               ║
 ╚═══════════════════════════════════════════════════════════════════╝
 
 📊 Coverage guidance stats:
@@ -181,7 +185,9 @@ tests/fuzzers/statetest/
 │   ├── splicing.go        # AFL splicing
 │   └── mutations_test.go  # Tests
 └── testdata/
-    └── seeds/             # Initial seed corpus
+    ├── seeds/             # Initial seed corpus
+    ├── enhanced_corpus/   # Coverage-finding inputs with gethTraceHash
+    └── crashes/           # Crash-inducing inputs
 ```
 
 ## Cross-Client Differential Testing
@@ -193,6 +199,42 @@ The fuzzer includes trace normalization for cross-client comparison:
 3. **Enhanced Corpus**: Coverage-finding inputs saved with trace hashes
 
 This enables replaying the corpus against other Ethereum clients (Nethermind, Besu, Erigon) to detect consensus divergences.
+
+### Trace Hash Format
+
+When inputs discover new coverage, they are saved to `testdata/enhanced_corpus/` with embedded metadata:
+
+```json
+{
+  "testName": {
+    "env": {...},
+    "pre": {...},
+    "transaction": {...},
+    "post": {...}
+  },
+  "_fuzzer": {
+    "gethTraceHash": "13251158d97ea2420d51501e32f818fc",
+    "stateRoot": "0x60a3fe53c5486f7967c947766fce4e08a7ebd8f3...",
+    "traceLines": 7,
+    "gasUsed": 118,
+    "gethVersion": "dev",
+    "generatedAt": "2025-12-08T10:50:16Z",
+    "coverageDelta": 0.00571,
+    "mutationStrategy": "gas"
+  }
+}
+```
+
+### Cross-VM Verification
+
+Other Ethereum clients can verify trace consistency by:
+
+1. Reading the `_fuzzer.gethTraceHash` from corpus entries
+2. Executing the test with their own normalized tracing
+3. Comparing their trace hash with the stored `gethTraceHash`
+4. Reporting divergences if hashes differ
+
+The `gethTraceHash` uses MD5 hashing of normalized trace output (opcode, depth, gas, stack top 6 values) for deterministic cross-client comparison.
 
 ## Performance
 

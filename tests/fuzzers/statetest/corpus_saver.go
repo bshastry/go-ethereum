@@ -27,7 +27,7 @@ import (
 
 // FuzzerMetadata contains cross-client verification data
 type FuzzerMetadata struct {
-	TraceHash      string  `json:"traceHash"`        // MD5 hash of normalized geth trace
+	GethTraceHash  string  `json:"gethTraceHash"`    // MD5 hash of normalized geth trace (for cross-VM comparison)
 	StateRoot      string  `json:"stateRoot"`        // Expected post-state root
 	TraceLines     int     `json:"traceLines"`       // Number of trace lines
 	GasUsed        uint64  `json:"gasUsed"`          // Gas consumed
@@ -71,7 +71,7 @@ func (cs *CorpusSaver) SaveEnhancedCorpusEntry(
 
 	// Add fuzzer metadata
 	meta := &FuzzerMetadata{
-		TraceHash:     traceResult.TraceHash,
+		GethTraceHash: traceResult.TraceHash,
 		StateRoot:     traceResult.StateRoot,
 		TraceLines:    traceResult.TraceLines,
 		GasUsed:       traceResult.GasUsed,
@@ -206,20 +206,20 @@ func (e *EnhancedCorpusEntry) HasMetadata() bool {
 	return e.Metadata != nil
 }
 
-// GetTraceHash returns the trace hash if available
+// GetTraceHash returns the geth trace hash if available
 func (e *EnhancedCorpusEntry) GetTraceHash() string {
 	if e.Metadata != nil {
-		return e.Metadata.TraceHash
+		return e.Metadata.GethTraceHash
 	}
 	return ""
 }
 
-// VerifyAgainstTrace verifies if a new trace matches the expected trace hash
+// VerifyAgainstTrace verifies if a new trace matches the expected geth trace hash
 func (e *EnhancedCorpusEntry) VerifyAgainstTrace(newTraceHash string) bool {
 	if e.Metadata == nil {
 		return false // Can't verify without metadata
 	}
-	return e.Metadata.TraceHash == newTraceHash
+	return e.Metadata.GethTraceHash == newTraceHash
 }
 
 // StripFuzzerMetadata returns the test JSON without fuzzer metadata
