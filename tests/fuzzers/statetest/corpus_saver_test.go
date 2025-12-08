@@ -610,3 +610,60 @@ func TestEESTFormatJSONStructure(t *testing.T) {
 
 	t.Logf("EEST-compliant JSON structure verified")
 }
+
+// TestIsCrossVMEntry_CaseInsensitive verifies case-insensitive generatedBy comparison.
+func TestIsCrossVMEntry_CaseInsensitive(t *testing.T) {
+	testCases := []struct {
+		generatedBy string
+		currentVM   string
+		isCrossVM   bool
+	}{
+		// Same VM - should NOT be cross-VM
+		{"geth", "geth", false},
+		{"GETH", "geth", false},     // Case insensitive
+		{"Geth", "geth", false},     // Case insensitive
+		{"besu", "besu", false},
+		{"BESU", "besu", false},
+		{"Besu", "BESU", false},
+
+		// Different VMs - should be cross-VM
+		{"besu", "geth", true},
+		{"BESU", "geth", true},
+		{"nethermind", "geth", true},
+		{"erigon", "besu", true},
+		{"revm", "geth", true},
+		{"evmone", "besu", true},
+
+		// Empty generatedBy - should NOT be cross-VM
+		{"", "geth", false},
+	}
+
+	for _, tc := range testCases {
+		entry := EnhancedCorpusEntry{
+			Metadata: &CrossVMMetadata{
+				GeneratedBy: tc.generatedBy,
+				TraceHash:   "somehash",
+			},
+		}
+		if tc.generatedBy == "" {
+			entry.Metadata.GeneratedBy = ""
+		}
+
+		result := entry.IsCrossVMEntry(tc.currentVM)
+		if result != tc.isCrossVM {
+			t.Errorf("IsCrossVMEntry(%q, %q) = %v, want %v",
+				tc.generatedBy, tc.currentVM, result, tc.isCrossVM)
+		}
+	}
+}
+
+// TestIsCrossVMEntry_NilMetadata verifies nil metadata handling.
+func TestIsCrossVMEntry_NilMetadata(t *testing.T) {
+	entry := EnhancedCorpusEntry{
+		Metadata: nil,
+	}
+
+	if entry.IsCrossVMEntry("geth") {
+		t.Error("IsCrossVMEntry should return false for nil metadata")
+	}
+}

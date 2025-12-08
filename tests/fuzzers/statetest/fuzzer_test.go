@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -235,8 +236,10 @@ func worker(
 		}
 
 		// Check if this is a cross-VM entry that needs verification
+		// Use case-insensitive comparison for compatibility with other client implementations
 		crossVMMeta := extractCrossVMMetadata(input)
-		if crossVMMeta != nil && crossVMMeta.GeneratedBy != "" && crossVMMeta.GeneratedBy != "geth" {
+		if crossVMMeta != nil && crossVMMeta.GeneratedBy != "" &&
+			!strings.EqualFold(crossVMMeta.GeneratedBy, "geth") {
 			// Cross-VM entry from another client - verify instead of mutate
 			verifyCrossVMEntry(input, crossVMMeta, stats, testTimeout)
 			continue
