@@ -100,16 +100,17 @@ FUZZ_STRATEGY=combined go test -cover -run=TestFuzzStateTestCustomMutator -v ./t
 │  │  ┌─────────────────────────────────────────────────────────────────────┐││
 │  │  │ Worker Loop:                                                        │││
 │  │  │  1. Pop input from priority queue                                   │││
-│  │  │  2. Get current coverage: before := testing.Coverage()              │││
-│  │  │  3. Strip stale _fuzzer metadata, then mutate input                 │││
-│  │  │  4. Execute with timeout via cancellationTracer                     │││
-│  │  │  5. Get new coverage: after := testing.Coverage()                   │││
-│  │  │  6. If after > before:                                              │││
+│  │  │  2. If cross-VM entry from another client: verify & continue        │││
+│  │  │  3. Get current coverage: before := testing.Coverage()              │││
+│  │  │  4. Strip stale _crossvm metadata, then mutate input                │││
+│  │  │  5. Execute with timeout via cancellationTracer                     │││
+│  │  │  6. Get new coverage: after := testing.Coverage()                   │││
+│  │  │  7. If after > before:                                              │││
 │  │  │     - Generate trace hash via ExecuteAndNormalize                   │││
-│  │  │     - Save enhanced corpus entry with gethTraceHash                 │││
+│  │  │     - Save enhanced corpus entry with _crossvm metadata             │││
 │  │  │     - Add mutated input to HIGH priority queue                      │││
 │  │  │     - Add to splicing corpus                                        │││
-│  │  │  7. Record stats (execs, crashes, timeouts, coverage, saved)        │││
+│  │  │  8. Record stats (execs, crashes, timeouts, coverage, saved)        │││
 │  │  └─────────────────────────────────────────────────────────────────────┘││
 │  └─────────────────────────────────────────────────────────────────────────┘│
 │                                                                              │
@@ -147,10 +148,9 @@ FUZZ_STRATEGY=combined go test -cover -run=TestFuzzStateTestCustomMutator -v ./t
 ╠═══════════════════════════════════════════════════════════════════╣
 ║ Crashes found:   0                                                ║
 ║ Timeouts:        0                                                ║
-║ Corpus saved:    31                                               ║
 ╚═══════════════════════════════════════════════════════════════════╝
 
-📊 Coverage guidance stats:
+Coverage guidance stats:
    - Avg execs per find: 6001
 ```
 
@@ -186,21 +186,43 @@ tests/fuzzers/statetest/
 │   └── mutations_test.go  # Tests
 └── testdata/
     ├── seeds/             # Initial seed corpus
-    ├── enhanced_corpus/   # Coverage-finding inputs with gethTraceHash
-    └── crashes/           # Crash-inducing inputs
+    ├── enhanced_corpus/   # Coverage-finding inputs with _crossvm metadata
+    └── crashes/           # Crash-inducing inputs and consensus divergences
 ```
 
 ## Cross-Client Differential Testing
 
-The fuzzer includes trace normalization for cross-client comparison:
+The fuzzer includes trace normalization for cross-client consensus verification, designed for 6-VM differential testing (geth, nethermind, besu, erigon, revm, evmone).
 
-1. **Trace Normalization**: Converts EVM traces to a canonical format
-2. **Trace Hashing**: MD5 hash of normalized traces for comparison
-3. **Enhanced Corpus**: Coverage-finding inputs saved with trace hashes
+### How It Works
 
-This enables replaying the corpus against other Ethereum clients (Nethermind, Besu, Erigon) to detect consensus divergences.
+1. **Trace Normalization**: Converts EVM traces to a canonical format matching goevmlab
+2. **Trace Hashing**: MD5 hash of normalized traces + stateRoot for comparison
+3. **Enhanced Corpus**: Coverage-finding inputs saved with `_crossvm` metadata
+4. **Cross-VM Verification**: When loading corpus from another client, verify instead of mutate
 
-### Trace Hash Format
+### Canonical Trace Format
+
+Normalized trace lines include only these fields (matching goevmlab defaults):
+- `depth` (decimal)
+- `pc` (decimal)
+- `section` (decimal, omitted if 0) - EOF only
+- `functionDepth` (decimal, omitted if 0) - EOF only
+- `gas` (decimal)
+- `op` (hex, 0x-prefixed, 2 digits, zero-padded)
+- `opName` (string)
+- `stack` (array of hex strings, last 6 items only, minimal representation)
+
+Example:
+```json
+{"depth":1,"pc":0,"gas":100000,"op":"0x60","opName":"PUSH1","stack":[]}
+{"depth":1,"pc":2,"gas":99997,"op":"0x60","opName":"PUSH1","stack":["0x2"]}
+{"stateRoot":"0x1234..."}
+```
+
+The hash is computed as: `MD5(trace_line_1 + "\n" + trace_line_2 + "\n" + ... + stateRoot_line + "\n")`
+
+### Cross-VM Metadata Format (`_crossvm`)
 
 When inputs discover new coverage, they are saved to `testdata/enhanced_corpus/` with embedded metadata:
 
@@ -212,29 +234,54 @@ When inputs discover new coverage, they are saved to `testdata/enhanced_corpus/`
     "transaction": {...},
     "post": {...}
   },
-  "_fuzzer": {
-    "gethTraceHash": "13251158d97ea2420d51501e32f818fc",
+  "_crossvm": {
+    "traceHash": "13251158d97ea2420d51501e32f818fc",
     "stateRoot": "0x60a3fe53c5486f7967c947766fce4e08a7ebd8f3...",
     "traceLines": 7,
-    "gasUsed": 118,
-    "gethVersion": "dev",
-    "generatedAt": "2025-12-08T10:50:16Z",
-    "coverageDelta": 0.00571,
-    "mutationStrategy": "gas"
+    "generatedBy": "geth",
+    "version": "dev",
+    "generatedAt": "2025-12-08T10:50:16Z"
   }
 }
 ```
 
-### Cross-VM Verification
+### Cross-VM Verification Mode
 
-Other Ethereum clients can verify trace consistency by:
+When the fuzzer encounters a corpus entry with `_crossvm` metadata from another client:
 
-1. Reading the `_fuzzer.gethTraceHash` from corpus entries
-2. Executing the test with their own normalized tracing
-3. Comparing their trace hash with the stored `gethTraceHash`
-4. Reporting divergences if hashes differ
+1. **Detect**: Check if `_crossvm.generatedBy != "geth"`
+2. **Verify**: Execute the test with normalized tracing (no mutation)
+3. **Compare**: Check if computed `traceHash` matches `_crossvm.traceHash`
+4. **Report**: If hashes differ, save divergence to `testdata/crashes/`
 
-The `gethTraceHash` uses MD5 hashing of normalized trace output (opcode, depth, gas, stack top 6 values) for deterministic cross-client comparison.
+This enables automatic detection of consensus bugs when running against a shared corpus.
+
+### Divergence Reporting
+
+When consensus divergences are detected:
+
+1. **Test input saved**: `testdata/crashes/divergence_N.json`
+2. **Log entry appended**: `testdata/crashes/crossvm_divergences.log`
+
+Log format:
+```
+[2024-01-15T12:00:00Z] CONSENSUS DIVERGENCE #1: source=besu expected=abc123... actual=def456...
+```
+
+Progress/final reports include cross-VM stats:
+```
+CROSS-VM: verified=150 divergences=2
+```
+
+### Implementing Cross-VM Support in Other Clients
+
+Other Ethereum clients can participate in cross-VM differential testing by:
+
+1. Implementing the same canonical trace format (field order, hex formatting)
+2. Including stateRoot as the final line in hash computation
+3. Reading `_crossvm` metadata from corpus entries
+4. Verifying entries from other clients instead of mutating them
+5. Saving discovered inputs with `"generatedBy": "clientname"`
 
 ## Performance
 
