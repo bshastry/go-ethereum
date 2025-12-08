@@ -450,7 +450,8 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 			}
 
 			// Corpus stats
-			hpLen, spLen, _, _ := corpus.Stats()
+			hpQueueLen, splicingLen, _, _ := corpus.Stats()
+			seedCount := corpus.SeedCount()
 
 			corpusSaved := atomic.LoadInt64(&stats.corpusSaved)
 			crossVMVerified := atomic.LoadInt64(&stats.crossVMVerified)
@@ -465,8 +466,8 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 				execs, rate, crashes, timeouts)
 			t.Logf(" COV:  %.3f%%  FINDS: %d  LAST: %s  GROWTH: %+.4f%%/min",
 				currentCov, covFinds, sinceLastFind, growthRate)
-			t.Logf(" QUEUE: %d  CORPUS: %d  SAVED: %d",
-				hpLen, spLen, corpusSaved)
+			t.Logf(" SEEDS: %d  HP_QUEUE: %d  SPLICING: %d  SAVED: %d",
+				seedCount, hpQueueLen, splicingLen, corpusSaved)
 			if crossVMVerified > 0 || crossVMFailed > 0 {
 				t.Logf(" CROSS-VM: verified=%d  divergences=%d", crossVMVerified, crossVMFailed)
 			}
@@ -491,7 +492,8 @@ func printFinalReport(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 	rate := float64(execs) / elapsed.Seconds()
 	currentCov := testing.Coverage() * 100
 
-	hpLen, spLen, _, _ := corpus.Stats()
+	hpQueueLen, splicingLen, _, _ := corpus.Stats()
+	seedCount := corpus.SeedCount()
 
 	t.Logf("")
 	t.Logf("╔═══════════════════════════════════════════════════════════════════╗")
@@ -503,8 +505,9 @@ func printFinalReport(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 	t.Logf("╠═══════════════════════════════════════════════════════════════════╣")
 	t.Logf("║ Final coverage:  %-48s ║", fmt.Sprintf("%.3f%%", currentCov))
 	t.Logf("║ Coverage finds:  %-48d ║", covFinds)
-	t.Logf("║ Corpus size:     %-48d ║", spLen)
-	t.Logf("║ Queue depth:     %-48d ║", hpLen)
+	t.Logf("║ Seeds:           %-48d ║", seedCount)
+	t.Logf("║ HP queue:        %-48d ║", hpQueueLen)
+	t.Logf("║ Splicing pool:   %-48d ║", splicingLen)
 	t.Logf("║ Corpus saved:    %-48d ║", corpusSaved)
 	t.Logf("╠═══════════════════════════════════════════════════════════════════╣")
 	t.Logf("║ Crashes found:   %-48d ║", crashes)

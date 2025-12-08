@@ -21,8 +21,14 @@ go test -cover -run=TestFuzzStateTestCustomMutator -v ./tests/fuzzers/statetest/
 
 ### Using goevmlab Corpus
 
+**Note:** Use absolute paths for `FUZZ_SEED_DIR` and `FUZZ_CORPUS_DIR`. Go tests run from the package directory (`tests/fuzzers/statetest`), not the shell's current directory.
+
 ```bash
-FUZZ_SEED_DIR=../goevmlab/corpus go test -cover -run=TestFuzzStateTestCustomMutator -v ./tests/fuzzers/statetest/
+# Use absolute path (recommended)
+FUZZ_SEED_DIR=/path/to/goevmlab/corpus go test -cover -run=TestFuzzStateTestCustomMutator -v ./tests/fuzzers/statetest/
+
+# Or use shell expansion
+FUZZ_SEED_DIR=$(pwd)/../goevmlab/corpus go test -cover -run=TestFuzzStateTestCustomMutator -v ./tests/fuzzers/statetest/
 ```
 
 ### Extended Run (24 hours, 32 workers)
@@ -131,7 +137,7 @@ FUZZ_STRATEGY=combined go test -cover -run=TestFuzzStateTestCustomMutator -v ./t
 ───────────────────────────────────────────────────────────────────
  EXEC: 186005 (6197/s)  CRASH: 0  TIMEOUT: 0
  COV:  31.646%  FINDS: 31  LAST: 27s  GROWTH: +0.0000%/min
- QUEUE: 0  CORPUS: 31  SAVED: 31
+ SEEDS: 54861  HP_QUEUE: 0  SPLICING: 31  SAVED: 31
 ═══════════════════════════════════════════════════════════════════
 
 ╔═══════════════════════════════════════════════════════════════════╗
@@ -143,8 +149,10 @@ FUZZ_STRATEGY=combined go test -cover -run=TestFuzzStateTestCustomMutator -v ./t
 ╠═══════════════════════════════════════════════════════════════════╣
 ║ Final coverage:  31.646%                                          ║
 ║ Coverage finds:  31                                               ║
-║ Corpus size:     31                                               ║
-║ Queue depth:     0                                                ║
+║ Seeds:           54861                                            ║
+║ HP queue:        0                                                ║
+║ Splicing pool:   31                                               ║
+║ Corpus saved:    31                                               ║
 ╠═══════════════════════════════════════════════════════════════════╣
 ║ Crashes found:   0                                                ║
 ║ Timeouts:        0                                                ║
