@@ -25,20 +25,50 @@ import (
 	"time"
 )
 
-// CrossVMMetadata contains cross-client verification data.
+// CrossVMMetadata contains cross-client verification data following the EEST standard.
 // This format is designed for 6-VM differential testing:
 // geth, nethermind, besu, erigon, revm, evmone
 //
-// When a VM loads a corpus entry with _crossvm metadata from another VM,
+// The metadata is stored inside the "_info" field of each test object, following
+// the EEST (Ethereum Execution Spec Tests) standard format. Example:
+//
+//	{
+//	  "testName": {
+//	    "_info": {
+//	      "comment": "Cross-VM consensus verification test",
+//	      "generatedBy": "geth",
+//	      "traceHash": "abc123...",
+//	      ...
+//	    },
+//	    "env": {...},
+//	    "pre": {...},
+//	    ...
+//	  }
+//	}
+//
+// When a VM loads a corpus entry with _info metadata from another VM,
 // it should execute the test without mutation and verify the trace hash matches.
 type CrossVMMetadata struct {
-	TraceHash   string `json:"traceHash"`   // MD5 hash of normalized trace + stateRoot (cross-VM comparable)
-	StateRoot   string `json:"stateRoot"`   // Expected post-state root (for quick pre-check)
-	TraceLines  int    `json:"traceLines"`  // Number of trace lines
-	GeneratedBy string `json:"generatedBy"` // Which VM generated this (geth, nethermind, besu, erigon, revm, evmone)
-	Version     string `json:"version"`     // VM version
-	GeneratedAt string `json:"generatedAt"` // ISO timestamp
+	// Required fields
+	Comment        string `json:"comment,omitempty"`        // Human-readable description
+	GeneratedBy    string `json:"generatedBy"`              // Which VM generated this (geth, nethermind, besu, erigon, revm, evmone)
+	TraceHash      string `json:"traceHash"`                // MD5 hash of normalized trace + stateRoot (cross-VM comparable)
+	StateRoot      string `json:"stateRoot"`                // Expected post-state root (for quick pre-check)
+	CrossVMVersion string `json:"crossvmVersion"`           // Metadata schema version (currently "1.0")
+	// Optional fields
+	TraceLines  int    `json:"traceLines,omitempty"`  // Number of trace lines
+	GeneratedAt string `json:"generatedAt,omitempty"` // ISO timestamp
+	Version     string `json:"version,omitempty"`     // VM version
+	Fork        string `json:"fork,omitempty"`        // Fork name (e.g., "Cancun", "Prague")
+	// EEST standard field (for compatibility with standard test format)
+	FixtureFormat string `json:"fixture-format,omitempty"` // Fixture format identifier
 }
+
+// CrossVMMetadataVersion is the current version of the cross-VM metadata schema
+const CrossVMMetadataVersion = "1.0"
+
+// CrossVMDefaultComment is the default comment for cross-VM generated tests
+const CrossVMDefaultComment = "Cross-VM consensus verification test"
 
 
 // CorpusSaver handles saving coverage-finding inputs with trace metadata
@@ -60,34 +90,65 @@ func NewCorpusSaver(corpusDir string) (*CorpusSaver, error) {
 	}, nil
 }
 
-// SaveEnhancedCorpusEntry saves a state test with embedded cross-VM metadata
+// SaveEnhancedCorpusEntry saves a state test with embedded cross-VM metadata.
+// The metadata is injected into the "_info" field inside each test object,
+// following the EEST (Ethereum Execution Spec Tests) standard format.
 func (cs *CorpusSaver) SaveEnhancedCorpusEntry(
 	testJSON []byte,
 	traceResult *TracingResult,
 	coverageDelta float64,
 	strategyName string,
 ) (string, error) {
-	// Parse original test
+	// Parse original test as map of test names to raw test objects
 	var original map[string]json.RawMessage
 	if err := json.Unmarshal(testJSON, &original); err != nil {
 		return "", fmt.Errorf("failed to parse test JSON: %w", err)
 	}
 
-	// Add cross-VM metadata (generalized for 6-VM differential testing)
+	// Build cross-VM metadata following EEST standard
 	meta := &CrossVMMetadata{
-		TraceHash:   traceResult.TraceHash,
-		StateRoot:   traceResult.StateRoot,
-		TraceLines:  traceResult.TraceLines,
-		GeneratedBy: "geth",
-		Version:     cs.gethVersion,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Comment:        CrossVMDefaultComment,
+		GeneratedBy:    "geth",
+		TraceHash:      traceResult.TraceHash,
+		StateRoot:      traceResult.StateRoot,
+		CrossVMVersion: CrossVMMetadataVersion,
+		TraceLines:     traceResult.TraceLines,
+		GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
+		Version:        cs.gethVersion,
 	}
 
 	metaJSON, err := json.Marshal(meta)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal metadata: %w", err)
 	}
-	original["_crossvm"] = metaJSON
+
+	// Inject _info into each test object (EEST standard placement)
+	for testName, testRaw := range original {
+		// Skip any legacy metadata keys at top level
+		if testName == "_crossvm" || testName == "_info" {
+			continue
+		}
+
+		// Parse the test object
+		var testObj map[string]json.RawMessage
+		if err := json.Unmarshal(testRaw, &testObj); err != nil {
+			// Not a valid test object, skip
+			continue
+		}
+
+		// Inject _info into the test object
+		testObj["_info"] = metaJSON
+
+		// Re-marshal the test object
+		updatedTestRaw, err := json.Marshal(testObj)
+		if err != nil {
+			return "", fmt.Errorf("failed to re-marshal test object %s: %w", testName, err)
+		}
+		original[testName] = updatedTestRaw
+	}
+
+	// Remove any legacy top-level _crossvm key (cleanup old format)
+	delete(original, "_crossvm")
 
 	// Generate filename from trace hash (first 16 chars for uniqueness)
 	filename := fmt.Sprintf("%s.json", traceResult.TraceHash[:16])
@@ -154,7 +215,9 @@ func getGethVersion() string {
 	return "dev"
 }
 
-// LoadEnhancedCorpus loads corpus entries with their cross-VM metadata
+// LoadEnhancedCorpus loads corpus entries with their cross-VM metadata.
+// It supports both the new EEST standard format (metadata in _info inside test objects)
+// and the legacy format (metadata in top-level _crossvm) for backward compatibility.
 func LoadEnhancedCorpus(corpusDir string) ([]EnhancedCorpusEntry, error) {
 	var entries []EnhancedCorpusEntry
 
@@ -181,19 +244,52 @@ func LoadEnhancedCorpus(corpusDir string) ([]EnhancedCorpusEntry, error) {
 			TestRaw: data,
 		}
 
-		// Extract cross-VM metadata if present
-		if crossvmRaw, ok := raw["_crossvm"]; ok {
-			var meta CrossVMMetadata
-			if err := json.Unmarshal(crossvmRaw, &meta); err == nil {
-				entry.Metadata = &meta
-			}
-		}
+		// Try to extract cross-VM metadata using the helper function
+		entry.Metadata = extractCrossVMMetadataFromRaw(raw)
 
 		entries = append(entries, entry)
 		return nil
 	})
 
 	return entries, err
+}
+
+// extractCrossVMMetadataFromRaw extracts cross-VM metadata from parsed JSON.
+// It supports both EEST standard format (_info inside test objects) and
+// legacy format (top-level _crossvm) for backward compatibility.
+func extractCrossVMMetadataFromRaw(raw map[string]json.RawMessage) *CrossVMMetadata {
+	// Try EEST standard format first: _info inside each test object
+	for testName, testRaw := range raw {
+		// Skip metadata keys
+		if testName == "_crossvm" || testName == "_info" {
+			continue
+		}
+
+		var testObj map[string]json.RawMessage
+		if err := json.Unmarshal(testRaw, &testObj); err != nil {
+			continue
+		}
+
+		if infoRaw, ok := testObj["_info"]; ok {
+			var meta CrossVMMetadata
+			if err := json.Unmarshal(infoRaw, &meta); err == nil {
+				// Validate that this is actually cross-VM metadata (has required fields)
+				if meta.GeneratedBy != "" && meta.TraceHash != "" {
+					return &meta
+				}
+			}
+		}
+	}
+
+	// Fallback to legacy format: top-level _crossvm
+	if crossvmRaw, ok := raw["_crossvm"]; ok {
+		var meta CrossVMMetadata
+		if err := json.Unmarshal(crossvmRaw, &meta); err == nil {
+			return &meta
+		}
+	}
+
+	return nil
 }
 
 // EnhancedCorpusEntry represents a corpus entry with optional cross-VM metadata
@@ -240,14 +336,44 @@ func (e *EnhancedCorpusEntry) VerifyAgainstTrace(newTraceHash string) bool {
 	return e.Metadata.TraceHash == newTraceHash
 }
 
-// StripCrossVMMetadata returns the test JSON without cross-VM metadata
+// StripCrossVMMetadata returns the test JSON without cross-VM metadata.
+// It removes both the EEST standard format (_info inside test objects) and
+// the legacy format (top-level _crossvm) for compatibility.
 func StripCrossVMMetadata(testJSON []byte) ([]byte, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(testJSON, &raw); err != nil {
 		return nil, err
 	}
 
+	// Remove legacy top-level _crossvm if present
 	delete(raw, "_crossvm")
+
+	// Remove _info from inside each test object (EEST standard format)
+	for testName, testRaw := range raw {
+		// Skip metadata keys
+		if testName == "_crossvm" || testName == "_info" {
+			continue
+		}
+
+		var testObj map[string]json.RawMessage
+		if err := json.Unmarshal(testRaw, &testObj); err != nil {
+			continue // Not a valid test object, skip
+		}
+
+		// Check if _info exists and contains cross-VM metadata
+		if infoRaw, ok := testObj["_info"]; ok {
+			var meta CrossVMMetadata
+			if err := json.Unmarshal(infoRaw, &meta); err == nil {
+				// Only remove if it's actually cross-VM metadata
+				if meta.GeneratedBy != "" || meta.TraceHash != "" {
+					delete(testObj, "_info")
+					if updated, err := json.Marshal(testObj); err == nil {
+						raw[testName] = updated
+					}
+				}
+			}
+		}
+	}
 
 	return json.Marshal(raw)
 }

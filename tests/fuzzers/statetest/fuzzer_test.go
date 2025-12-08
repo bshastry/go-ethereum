@@ -303,23 +303,17 @@ func worker(
 	}
 }
 
-// extractCrossVMMetadata extracts cross-VM metadata from a test JSON if present
+// extractCrossVMMetadata extracts cross-VM metadata from a test JSON if present.
+// It supports both the EEST standard format (_info inside test objects) and
+// the legacy format (top-level _crossvm) for backward compatibility.
 func extractCrossVMMetadata(testJSON []byte) *CrossVMMetadata {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(testJSON, &raw); err != nil {
 		return nil
 	}
 
-	crossvmRaw, ok := raw["_crossvm"]
-	if !ok {
-		return nil
-	}
-
-	var meta CrossVMMetadata
-	if err := json.Unmarshal(crossvmRaw, &meta); err != nil {
-		return nil
-	}
-	return &meta
+	// Use the shared helper function from corpus_saver.go
+	return extractCrossVMMetadataFromRaw(raw)
 }
 
 // verifyCrossVMEntry verifies a cross-VM corpus entry and logs divergences
