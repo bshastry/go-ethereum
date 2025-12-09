@@ -151,34 +151,49 @@ func (cs *CorpusSaver) SaveEnhancedCorpusEntry(
 	// Remove any legacy top-level _crossvm key (cleanup old format)
 	delete(original, "_crossvm")
 
-	// Generate filename from trace hash (first 16 chars for uniqueness)
-	filename := fmt.Sprintf("%s.json", traceResult.TraceHash[:16])
-	fullPath := filepath.Join(cs.corpusDir, filename)
-
-	// Check if file already exists (duplicate trace hash)
-	if _, err := os.Stat(fullPath); err == nil {
-		// File exists, append a counter
-		for i := 1; i < 1000; i++ {
-			filename = fmt.Sprintf("%s_%d.json", traceResult.TraceHash[:16], i)
-			fullPath = filepath.Join(cs.corpusDir, filename)
-			if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-				break
-			}
-		}
-	}
-
 	// Write with pretty printing
 	output, err := json.MarshalIndent(original, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal enhanced test: %w", err)
 	}
 
-	if err := os.WriteFile(fullPath, output, 0644); err != nil {
-		return "", fmt.Errorf("failed to write corpus file: %w", err)
+	// Generate filename from trace hash (first 16 chars for uniqueness).
+	// Use O_EXCL for atomic file creation to avoid race conditions when
+	// multiple workers produce the same trace hash concurrently.
+	baseFilename := traceResult.TraceHash[:16]
+
+	// Try to create file atomically with O_EXCL (fails if exists)
+	for i := 0; i < 10000; i++ {
+		var filename string
+		if i == 0 {
+			filename = baseFilename + ".json"
+		} else {
+			filename = fmt.Sprintf("%s_%d.json", baseFilename, i)
+		}
+		fullPath := filepath.Join(cs.corpusDir, filename)
+
+		// O_EXCL ensures atomic create - fails if file exists
+		f, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err != nil {
+			if os.IsExist(err) {
+				continue // File exists, try next counter
+			}
+			return "", fmt.Errorf("failed to create corpus file: %w", err)
+		}
+		// Successfully created file exclusively
+		_, writeErr := f.Write(output)
+		closeErr := f.Close()
+		if writeErr != nil {
+			return "", fmt.Errorf("failed to write corpus file: %w", writeErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("failed to close corpus file: %w", closeErr)
+		}
+		cs.savedCount++
+		return fullPath, nil
 	}
 
-	cs.savedCount++
-	return fullPath, nil
+	return "", fmt.Errorf("failed to find unique filename after 10000 attempts for hash %s", baseFilename)
 }
 
 // SavedCount returns the number of corpus entries saved

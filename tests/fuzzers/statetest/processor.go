@@ -329,28 +329,42 @@ func (bp *BatchProcessor) writeOutput(inputPath string, data []byte, traceResult
 		return "", fmt.Errorf("inject metadata: %w", err)
 	}
 
-	// Generate output filename (use trace hash prefix for uniqueness)
-	filename := fmt.Sprintf("%s.json", traceResult.TraceHash[:16])
-	outputPath := filepath.Join(bp.outputDir, "tests", filename)
+	// Generate output filename using trace hash prefix.
+	// Use O_EXCL for atomic file creation to avoid race conditions when
+	// multiple workers produce the same trace hash concurrently.
+	baseFilename := traceResult.TraceHash[:16]
 
-	// Handle existing files
-	if _, err := os.Stat(outputPath); err == nil && !bp.config.Overwrite {
-		// File exists, append counter
-		for i := 1; i < 1000; i++ {
-			filename = fmt.Sprintf("%s_%d.json", traceResult.TraceHash[:16], i)
-			outputPath = filepath.Join(bp.outputDir, "tests", filename)
-			if _, err := os.Stat(outputPath); os.IsNotExist(err) {
-				break
-			}
+	// Try to create file atomically with O_EXCL (fails if exists)
+	for i := 0; i < 10000; i++ {
+		var filename string
+		if i == 0 {
+			filename = baseFilename + ".json"
+		} else {
+			filename = fmt.Sprintf("%s_%d.json", baseFilename, i)
 		}
+		outputPath := filepath.Join(bp.outputDir, "tests", filename)
+
+		// O_EXCL ensures atomic create - fails if file exists
+		f, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err != nil {
+			if os.IsExist(err) {
+				continue // File exists, try next counter
+			}
+			return "", err // Other error
+		}
+		// Successfully created file exclusively
+		_, writeErr := f.Write(enhanced)
+		closeErr := f.Close()
+		if writeErr != nil {
+			return "", writeErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		return outputPath, nil
 	}
 
-	// Write file
-	if err := os.WriteFile(outputPath, enhanced, 0644); err != nil {
-		return "", err
-	}
-
-	return outputPath, nil
+	return "", fmt.Errorf("failed to find unique filename after 10000 attempts for hash %s", baseFilename)
 }
 
 // collector collects results and updates statistics
