@@ -125,6 +125,10 @@ The `fuzz.sh` script provides sensible defaults and automatically includes EVM c
 | `FUZZ_SEED_DIR` | `testdata/seeds` | Directory containing seed JSON files |
 | `FUZZ_STRATEGY` | `combined` | Mutation strategy to use |
 | `FUZZ_CORPUS_DIR` | `testdata/enhanced_corpus` | Output directory for trace-enhanced corpus entries |
+| `FUZZ_ADAPTIVE_HP` | `false` | Enable adaptive HP probability (opt-in) |
+| `FUZZ_ADAPTIVE_HP_MIN` | `0.2` | Minimum HP probability bound |
+| `FUZZ_ADAPTIVE_HP_MAX` | `0.95` | Maximum HP probability bound |
+| `FUZZ_ADAPTIVE_DROUGHT_SEC` | `30` | Drought detection threshold in seconds |
 
 ## Mutation Strategies
 
@@ -458,9 +462,19 @@ SPLICE_DONORS: coverage=8234 (70.2%) seeds=3490 (29.8%)
 | `minPriority` | 1 | Floor value before culling eligible |
 | `minPicksToCull` | 10 | Minimum picks before culling eligible |
 | `cullInterval` | 1000 | Check for culling every N pops |
-| `highPriorityP` | 0.8 | Probability of selecting from HP queue |
+| `highPriorityP` | 0.8 | Base probability of selecting from HP queue |
 | `maxQueueSize` | 10000 | Max HP queue size (0 = unlimited) |
 | `maxSplicingLen` | 10000 | Max splicing pool size |
+
+**Adaptive HP Options** (opt-in):
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `adaptiveHP` | false | Enable adaptive HP probability adjustment |
+| `adaptiveMinP` | 0.2 | Minimum probability bound |
+| `adaptiveMaxP` | 0.95 | Maximum probability bound |
+| `adaptiveDroughtThreshold` | 30s | Time without finds before reducing HP probability |
+| `adaptiveWarmupPicks` | 500 | Picks before adaptation fully activates |
 
 Configuration via functional options:
 ```go
@@ -469,8 +483,65 @@ corpus := NewCoverageCorpus(seeds,
     WithMinPriority(1),          // Keep default
     WithMinPicksToCull(20),      // Require more picks before culling
     WithHighPriorityProbability(0.9), // More HP-focused
+
+    // Enable adaptive HP probability
+    WithAdaptiveHP(true),
+    WithAdaptiveBounds(0.2, 0.95),
+    WithAdaptiveDroughtThreshold(30 * time.Second),
 )
 ```
+
+### Adaptive HP Probability
+
+When enabled (`WithAdaptiveHP(true)`), the HP probability dynamically adjusts based on:
+
+```
+effectiveP = clamp(baseP + queueAdj + droughtAdj + successAdj, minP, maxP)
+```
+
+**Additive Factors:**
+
+| Factor | Range | Description |
+|--------|-------|-------------|
+| `queueAdj` | [-0.30, +0.15] | Reduces probability when HP queue is empty/small, slight boost when full |
+| `droughtAdj` | [-0.20, 0] | Reduces probability during coverage droughts to explore more seeds |
+| `successAdj` | [-0.15, +0.15] | Adjusts toward whichever source (HP or seeds) has better efficiency |
+
+**Queue Adjustment Curve:**
+```
+HP Queue Size | Adjustment
+--------------|----------
+0             | -0.30 (force more seeds)
+1             | -0.20
+10            | -0.10
+100           | 0.00
+1000          | +0.10
+10000+        | +0.15
+```
+
+**Drought Adjustment Curve:**
+```
+Time Since Find | Adjustment
+----------------|----------
+<30s            | 0.00
+1x threshold    | -0.05
+2x threshold    | -0.10
+5x threshold    | -0.15
+10x threshold+  | -0.20 (floor)
+```
+
+**Success Adjustment:**
+- Compares `hpEfficiency` vs `seedEfficiency` (finds per pick)
+- Adjusts toward the more productive source
+- Requires warmup period (500 picks) before activating
+
+**Cold Start Phase-In:**
+```go
+confidence := min(1.0, totalPicks / warmupPicks)
+adjustment = adjustment * confidence  // Gradually increase from 0 to full
+```
+
+This prevents sudden probability swings during the first few hundred picks when statistical data is insufficient.
 
 ### Source Statistics: Cumulative vs Per-Interval
 

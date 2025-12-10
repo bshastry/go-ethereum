@@ -20,8 +20,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,6 +115,17 @@ type CoverageCorpus struct {
 	// Splice donor tracking
 	spliceCoverageDonors int64 // Times splicingPool was selected as donor
 	spliceSeedDonors     int64 // Times seeds were selected as donor
+
+	// Adaptive HP probability configuration
+	adaptiveHP               bool          // Enable adaptive HP probability
+	adaptiveMinP             float64       // Minimum probability bound (default 0.2)
+	adaptiveMaxP             float64       // Maximum probability bound (default 0.95)
+	adaptiveDroughtThreshold time.Duration // Time without find before drought adjustment (default 30s)
+	adaptiveWarmupPicks      int64         // Picks needed before full adaptation (default 500)
+
+	// Adaptive HP probability tracking (atomic counters for thread safety)
+	hpFinds   int64 // Coverage finds from HP picks (atomic)
+	seedFinds int64 // Coverage finds from seed picks (atomic)
 }
 
 // CoverageCorpusOption is a functional option for configuring CoverageCorpus
@@ -177,6 +190,52 @@ func WithMinPicksToCull(picks int) CoverageCorpusOption {
 	}
 }
 
+// WithAdaptiveHP enables or disables adaptive HP probability.
+// When enabled, the effective HP probability is dynamically adjusted based on:
+//   - Queue fullness (empty queue reduces HP probability)
+//   - Coverage drought (long time without finds reduces HP probability)
+//   - Source efficiency (favors the more efficient source)
+func WithAdaptiveHP(enabled bool) CoverageCorpusOption {
+	return func(c *CoverageCorpus) {
+		c.adaptiveHP = enabled
+	}
+}
+
+// WithAdaptiveBounds sets the minimum and maximum bounds for adaptive HP probability.
+// The effective probability will be clamped to [minP, maxP].
+// Default: minP=0.2, maxP=0.95
+func WithAdaptiveBounds(minP, maxP float64) CoverageCorpusOption {
+	return func(c *CoverageCorpus) {
+		if minP >= 0 && minP <= 1 && maxP >= 0 && maxP <= 1 && minP <= maxP {
+			c.adaptiveMinP = minP
+			c.adaptiveMaxP = maxP
+		}
+	}
+}
+
+// WithAdaptiveDroughtThreshold sets the time threshold for drought adjustment.
+// When time since last coverage find exceeds this threshold, HP probability is reduced.
+// Default: 30s
+func WithAdaptiveDroughtThreshold(d time.Duration) CoverageCorpusOption {
+	return func(c *CoverageCorpus) {
+		if d > 0 {
+			c.adaptiveDroughtThreshold = d
+		}
+	}
+}
+
+// WithAdaptiveWarmupPicks sets the number of picks before full adaptation kicks in.
+// During warmup, adjustments are scaled by (totalPicks / warmupPicks).
+// Set to 0 to disable warmup phase (full adaptation immediately).
+// Default: 500
+func WithAdaptiveWarmupPicks(picks int64) CoverageCorpusOption {
+	return func(c *CoverageCorpus) {
+		if picks >= 0 {
+			c.adaptiveWarmupPicks = picks
+		}
+	}
+}
+
 // NewCoverageCorpus creates a corpus with initial seeds
 func NewCoverageCorpus(seeds [][]byte, opts ...CoverageCorpusOption) *CoverageCorpus {
 	c := &CoverageCorpus{
@@ -196,6 +255,12 @@ func NewCoverageCorpus(seeds [][]byte, opts ...CoverageCorpusOption) *CoverageCo
 		popsSinceCull:  0,
 		lastFindTime:   time.Now(),
 		totalCulled:    0,
+		// Adaptive HP probability defaults
+		adaptiveHP:               false, // Opt-in feature
+		adaptiveMinP:             0.2,   // Never go below 20% HP probability
+		adaptiveMaxP:             0.95,  // Never go above 95% HP probability
+		adaptiveDroughtThreshold: 30 * time.Second,
+		adaptiveWarmupPicks:      500,
 	}
 
 	// Copy seeds to prevent external modification
@@ -226,8 +291,14 @@ func (c *CoverageCorpus) Pop() []byte {
 		c.popsSinceCull = 0
 	}
 
+	// Determine effective HP probability
+	effectiveP := c.highPriorityP
+	if c.adaptiveHP {
+		effectiveP = c.computeAdaptivePLocked()
+	}
+
 	// Decide whether to use high priority queue
-	useHighPriority := len(c.hpQueue) > 0 && c.rng.Float64() < c.highPriorityP
+	useHighPriority := len(c.hpQueue) > 0 && c.rng.Float64() < effectiveP
 
 	if useHighPriority {
 		c.hpPicks++
@@ -287,9 +358,7 @@ func (c *CoverageCorpus) weightedSelectLocked() *PriorityInput {
 func (c *CoverageCorpus) applyDecayLocked(item *PriorityInput) {
 	oldPriority := item.Priority
 	newPriority := int(float64(item.Priority) * c.decayRate)
-	if newPriority < c.minPriority {
-		newPriority = c.minPriority
-	}
+	newPriority = max(newPriority, c.minPriority)
 
 	// Update running sum
 	c.totalPriority -= int64(oldPriority)
@@ -323,6 +392,229 @@ func (c *CoverageCorpus) cullLocked() int {
 	c.totalCulled += int64(culled)
 	return culled
 }
+
+// =============================================================================
+// Adaptive HP Probability Implementation
+// =============================================================================
+
+// computeAdaptivePLocked computes the effective HP probability using additive factors.
+// MUST be called with c.mu held.
+//
+// The formula is: effectiveP = clamp(baseP + queueAdj + droughtAdj + successAdj, minP, maxP)
+// Adjustments are scaled by a confidence factor during warmup.
+func (c *CoverageCorpus) computeAdaptivePLocked() float64 {
+	baseP := c.highPriorityP
+	totalPicks := c.hpPicks + c.seedPicks
+
+	// Compute individual adjustment factors
+	queueAdj := queueAdjustment(len(c.hpQueue))
+	droughtAdj := droughtAdjustment(time.Since(c.lastFindTime), c.adaptiveDroughtThreshold)
+
+	// Read atomic counters - we hold the lock so direct read is safe
+	hpFinds := atomic.LoadInt64(&c.hpFinds)
+	seedFinds := atomic.LoadInt64(&c.seedFinds)
+	successAdj := successAdjustment(hpFinds, c.hpPicks, seedFinds, c.seedPicks)
+
+	// Compute total adjustment
+	totalAdj := queueAdj + droughtAdj + successAdj
+
+	// Apply confidence weighting for cold start phase-in
+	// When warmupPicks is 0, skip warmup entirely (full confidence)
+	// When warmupPicks > 0, scale confidence from 0 to 1 based on totalPicks
+	confidence := 1.0
+	if c.adaptiveWarmupPicks > 0 {
+		if totalPicks < c.adaptiveWarmupPicks {
+			confidence = float64(totalPicks) / float64(c.adaptiveWarmupPicks)
+		}
+		// If totalPicks >= warmupPicks, confidence stays at 1.0
+	}
+	// Note: if warmupPicks == 0, confidence stays at 1.0 (no warmup phase)
+	totalAdj *= confidence
+
+	// Compute effective probability with bounds
+	effectiveP := baseP + totalAdj
+
+	// Handle edge cases (NaN, Inf)
+	if math.IsNaN(effectiveP) || math.IsInf(effectiveP, 0) {
+		effectiveP = baseP
+	}
+
+	// Clamp to bounds
+	return clampFloat64(effectiveP, c.adaptiveMinP, c.adaptiveMaxP)
+}
+
+// queueAdjustment returns an adjustment based on HP queue fullness.
+// Range: [-0.30, +0.15]
+//
+// Mapping:
+//   - hpLen=0:      -0.30 (force more seeds)
+//   - hpLen=1-10:   -0.20 to -0.10
+//   - hpLen=100:    0.00
+//   - hpLen=1000:   +0.10
+//   - hpLen=10000:  +0.15
+func queueAdjustment(hpLen int) float64 {
+	if hpLen == 0 {
+		return -0.30
+	}
+
+	// Use logarithmic scaling for queue size
+	// log10(1) = 0, log10(10) = 1, log10(100) = 2, log10(1000) = 3, log10(10000) = 4
+	logLen := math.Log10(float64(hpLen))
+
+	// Map log scale to adjustment:
+	// logLen=0 (hpLen=1): -0.20
+	// logLen=1 (hpLen=10): -0.10
+	// logLen=2 (hpLen=100): 0.00
+	// logLen=3 (hpLen=1000): +0.10
+	// logLen=4 (hpLen=10000): +0.15
+	var adj float64
+	switch {
+	case logLen < 1:
+		// Linear interpolation from -0.20 to -0.10 for logLen in [0, 1)
+		adj = -0.20 + (logLen * 0.10)
+	case logLen < 2:
+		// Linear interpolation from -0.10 to 0.00 for logLen in [1, 2)
+		adj = -0.10 + ((logLen - 1) * 0.10)
+	case logLen < 3:
+		// Linear interpolation from 0.00 to +0.10 for logLen in [2, 3)
+		adj = 0.00 + ((logLen - 2) * 0.10)
+	default:
+		// Linear interpolation from +0.10 to +0.15 for logLen in [3, 4+)
+		// Cap at +0.15
+		adj = 0.10 + math.Min((logLen-3)*0.05, 0.05)
+	}
+
+	return clampFloat64(adj, -0.30, 0.15)
+}
+
+// droughtAdjustment returns an adjustment based on time since last coverage find.
+// Range: [-0.20, 0.00]
+//
+// Mapping:
+//   - <threshold:    0.00 (no adjustment)
+//   - 1x threshold:  -0.05
+//   - 2x threshold:  -0.10
+//   - 5x threshold:  -0.15
+//   - 10x threshold: -0.20 (floor)
+func droughtAdjustment(timeSinceFind, threshold time.Duration) float64 {
+	if threshold <= 0 || timeSinceFind < threshold {
+		return 0.0
+	}
+
+	// How many multiples of threshold have elapsed?
+	ratio := float64(timeSinceFind) / float64(threshold)
+
+	// Use logarithmic scaling: log2(ratio) gives us a gradual increase
+	// ratio=1: log2(1)=0, ratio=2: log2(2)=1, ratio=4: log2(4)=2, ratio=10: log2(10)~3.32
+	logRatio := math.Log2(ratio)
+
+	// Scale: each doubling of time adds -0.05 adjustment
+	// log2(1)=0 -> -0.05, log2(2)=1 -> -0.10, log2(4)=2 -> -0.15, log2(8+)=3+ -> -0.20
+	adj := -0.05 * (logRatio + 1)
+
+	return clampFloat64(adj, -0.20, 0.0)
+}
+
+// successAdjustment returns an adjustment based on relative efficiency of HP vs seeds.
+// Range: [-0.15, +0.15]
+//
+// Uses efficiency ratios (finds/picks) to avoid positive feedback loops.
+// Mapping:
+//   - HP efficiency == seed efficiency: 0.00
+//   - HP 2x more efficient: +0.10
+//   - HP 3x more efficient: +0.15
+//   - Seed 2x more efficient: -0.10
+//   - Seed 3x more efficient: -0.15
+func successAdjustment(hpFinds, hpPicks, seedFinds, seedPicks int64) float64 {
+	// Require minimum picks from both sources to make a meaningful comparison
+	const minPicks = 50
+	if hpPicks < minPicks || seedPicks < minPicks {
+		return 0.0
+	}
+
+	// Compute efficiency ratios (finds per pick)
+	hpEfficiency := float64(hpFinds) / float64(hpPicks)
+	seedEfficiency := float64(seedFinds) / float64(seedPicks)
+
+	// Handle edge case: both have zero finds
+	if hpEfficiency == 0 && seedEfficiency == 0 {
+		return 0.0
+	}
+
+	// Handle edge case: only one has finds
+	if seedEfficiency == 0 {
+		// HP is infinitely more efficient - cap at max positive
+		return 0.15
+	}
+	if hpEfficiency == 0 {
+		// Seed is infinitely more efficient - cap at max negative
+		return -0.15
+	}
+
+	// Compute efficiency ratio: values > 1 mean HP is more efficient
+	efficiencyRatio := hpEfficiency / seedEfficiency
+
+	// Handle edge cases
+	if math.IsNaN(efficiencyRatio) || math.IsInf(efficiencyRatio, 0) {
+		return 0.0
+	}
+
+	// Map ratio to adjustment using logarithmic scaling
+	// ratio=1: log2(1)=0 -> 0.00
+	// ratio=2: log2(2)=1 -> +0.10
+	// ratio=3: log2(3)~1.58 -> +0.15 (capped)
+	// ratio=0.5: log2(0.5)=-1 -> -0.10
+	// ratio=0.33: log2(0.33)~-1.58 -> -0.15 (capped)
+	logRatio := math.Log2(efficiencyRatio)
+
+	// Scale: each doubling of efficiency adds 0.10 adjustment
+	adj := logRatio * 0.10
+
+	return clampFloat64(adj, -0.15, 0.15)
+}
+
+// clampFloat64 clamps a float64 value to the range [min, max].
+func clampFloat64(val, min, max float64) float64 {
+	if val < min {
+		return min
+	}
+	if val > max {
+		return max
+	}
+	return val
+}
+
+// RecordFind records that a coverage find occurred from the specified source.
+// This is used for adaptive HP probability to track which source is more efficient.
+// Call this when new coverage is found, with fromHP=true if the input came from
+// the HP queue, or fromHP=false if it came from seeds.
+//
+// Thread-safe: uses atomic counters.
+func (c *CoverageCorpus) RecordFind(fromHP bool) {
+	if fromHP {
+		atomic.AddInt64(&c.hpFinds, 1)
+	} else {
+		atomic.AddInt64(&c.seedFinds, 1)
+	}
+}
+
+// GetAdaptiveP returns the current effective HP probability.
+// Returns the static highPriorityP if adaptive mode is disabled.
+// Useful for monitoring/debugging.
+func (c *CoverageCorpus) GetAdaptiveP() float64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.adaptiveHP {
+		return c.highPriorityP
+	}
+
+	return c.computeAdaptivePLocked()
+}
+
+// =============================================================================
+// End Adaptive HP Probability Implementation
+// =============================================================================
 
 // boostPriorityLocked increases an existing item's priority. MUST be called with c.mu held.
 func (c *CoverageCorpus) boostPriorityLocked(item *PriorityInput, coverageDelta float64) {
@@ -505,6 +797,18 @@ type CoverageCorpusStats struct {
 	TotalPriority int64   // Current sum of all priorities
 	TotalCulled   int64   // Total items ever culled
 	AvgPickCount  float64 // Average picks per item in queue
+
+	// Adaptive HP probability stats
+	AdaptiveEnabled bool    // Whether adaptive HP probability is enabled
+	EffectiveP      float64 // Current effective HP probability
+	HPFinds         int64   // Coverage finds from HP picks
+	SeedFinds       int64   // Coverage finds from seed picks
+	HPEfficiency    float64 // Finds per pick for HP queue
+	SeedEfficiency  float64 // Finds per pick for seeds
+	QueueAdj        float64 // Current queue adjustment factor
+	DroughtAdj      float64 // Current drought adjustment factor
+	SuccessAdj      float64 // Current success adjustment factor
+	Confidence      float64 // Warmup confidence (0-1)
 }
 
 // FullStats returns detailed corpus statistics
@@ -522,6 +826,38 @@ func (c *CoverageCorpus) FullStats() CoverageCorpusStats {
 		avgPickCount = float64(totalPicks) / float64(len(c.hpQueue))
 	}
 
+	// Compute adaptive stats
+	hpFinds := atomic.LoadInt64(&c.hpFinds)
+	seedFinds := atomic.LoadInt64(&c.seedFinds)
+
+	var hpEfficiency, seedEfficiency float64
+	if c.hpPicks > 0 {
+		hpEfficiency = float64(hpFinds) / float64(c.hpPicks)
+	}
+	if c.seedPicks > 0 {
+		seedEfficiency = float64(seedFinds) / float64(c.seedPicks)
+	}
+
+	// Compute individual adjustment factors for observability
+	queueAdj := queueAdjustment(len(c.hpQueue))
+	droughtAdj := droughtAdjustment(time.Since(c.lastFindTime), c.adaptiveDroughtThreshold)
+	successAdj := successAdjustment(hpFinds, c.hpPicks, seedFinds, c.seedPicks)
+
+	// Compute confidence (consistent with computeAdaptivePLocked)
+	totalPicks := c.hpPicks + c.seedPicks
+	confidence := 1.0
+	if c.adaptiveWarmupPicks > 0 {
+		if totalPicks < c.adaptiveWarmupPicks {
+			confidence = float64(totalPicks) / float64(c.adaptiveWarmupPicks)
+		}
+	}
+
+	// Compute effective probability
+	effectiveP := c.highPriorityP
+	if c.adaptiveHP {
+		effectiveP = c.computeAdaptivePLocked()
+	}
+
 	return CoverageCorpusStats{
 		HPQueueLen:           len(c.hpQueue),
 		SplicingLen:          len(c.splicingPool),
@@ -536,6 +872,17 @@ func (c *CoverageCorpus) FullStats() CoverageCorpusStats {
 		TotalPriority:        c.totalPriority,
 		TotalCulled:          c.totalCulled,
 		AvgPickCount:         avgPickCount,
+		// Adaptive stats
+		AdaptiveEnabled: c.adaptiveHP,
+		EffectiveP:      effectiveP,
+		HPFinds:         hpFinds,
+		SeedFinds:       seedFinds,
+		HPEfficiency:    hpEfficiency,
+		SeedEfficiency:  seedEfficiency,
+		QueueAdj:        queueAdj,
+		DroughtAdj:      droughtAdj,
+		SuccessAdj:      successAdj,
+		Confidence:      confidence,
 	}
 }
 
@@ -578,4 +925,15 @@ func (c *CoverageCorpus) Clear() {
 	c.totalInputsAdded = 0
 	c.totalCulled = 0
 	c.popsSinceCull = 0
+
+	// Reset pick counters
+	c.hpPicks = 0
+	c.seedPicks = 0
+
+	// Reset adaptive HP probability counters
+	atomic.StoreInt64(&c.hpFinds, 0)
+	atomic.StoreInt64(&c.seedFinds, 0)
+
+	// Reset lastFindTime to now
+	c.lastFindTime = time.Now()
 }
