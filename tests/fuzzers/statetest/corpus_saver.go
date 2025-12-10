@@ -30,13 +30,15 @@ import (
 // This format is designed for 6-VM differential testing:
 // geth, nethermind, besu, erigon, revm, evmone
 //
-// The metadata is stored inside the "_info" field of each test object, following
-// the EEST (Ethereum Execution Spec Tests) standard format. Example:
+// The metadata is merged into the existing "_info" field of each test object,
+// preserving original EEST provenance (comment, description, url, reference-spec, etc.)
+// while adding cross-VM verification fields. Example:
 //
 //	{
 //	  "testName": {
 //	    "_info": {
-//	      "comment": "Cross-VM consensus verification test",
+//	      "comment": "original EEST comment preserved",
+//	      "description": "original test description",
 //	      "generatedBy": "geth",
 //	      "traceHash": "abc123...",
 //	      ...
@@ -51,25 +53,19 @@ import (
 // it should execute the test without mutation and verify the trace hash matches.
 type CrossVMMetadata struct {
 	// Required fields
-	Comment        string `json:"comment,omitempty"`        // Human-readable description
-	GeneratedBy    string `json:"generatedBy"`              // Which VM generated this (geth, nethermind, besu, erigon, revm, evmone)
-	TraceHash      string `json:"traceHash"`                // MD5 hash of normalized trace + stateRoot (cross-VM comparable)
-	StateRoot      string `json:"stateRoot"`                // Expected post-state root (for quick pre-check)
-	CrossVMVersion string `json:"crossvmVersion"`           // Metadata schema version (currently "1.0")
+	GeneratedBy    string `json:"generatedBy"`    // Which VM generated this (geth, nethermind, besu, erigon, revm, evmone)
+	TraceHash      string `json:"traceHash"`      // MD5 hash of normalized trace + stateRoot (cross-VM comparable)
+	StateRoot      string `json:"stateRoot"`      // Expected post-state root (for quick pre-check)
+	CrossVMVersion string `json:"crossvmVersion"` // Metadata schema version (currently "1.0")
 	// Optional fields
 	TraceLines  int    `json:"traceLines,omitempty"`  // Number of trace lines
 	GeneratedAt string `json:"generatedAt,omitempty"` // ISO timestamp
 	Version     string `json:"version,omitempty"`     // VM version
 	Fork        string `json:"fork,omitempty"`        // Fork name (e.g., "Cancun", "Prague")
-	// EEST standard field (for compatibility with standard test format)
-	FixtureFormat string `json:"fixture-format,omitempty"` // Fixture format identifier
 }
 
 // CrossVMMetadataVersion is the current version of the cross-VM metadata schema
 const CrossVMMetadataVersion = "1.0"
-
-// CrossVMDefaultComment is the default comment for cross-VM generated tests
-const CrossVMDefaultComment = "Cross-VM consensus verification test"
 
 
 // CorpusSaver handles saving coverage-finding inputs with trace metadata
@@ -108,7 +104,6 @@ func (cs *CorpusSaver) SaveEnhancedCorpusEntry(
 
 	// Build cross-VM metadata following EEST standard
 	meta := &CrossVMMetadata{
-		Comment:        CrossVMDefaultComment,
 		GeneratedBy:    "geth",
 		TraceHash:      traceResult.TraceHash,
 		StateRoot:      traceResult.StateRoot,
@@ -118,12 +113,7 @@ func (cs *CorpusSaver) SaveEnhancedCorpusEntry(
 		Version:        cs.gethVersion,
 	}
 
-	metaJSON, err := json.Marshal(meta)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal metadata: %w", err)
-	}
-
-	// Inject _info into each test object (EEST standard placement)
+	// Merge _info into each test object, preserving existing EEST metadata
 	for testName, testRaw := range original {
 		// Skip any legacy metadata keys at top level
 		if testName == "_crossvm" || testName == "_info" {
@@ -137,8 +127,39 @@ func (cs *CorpusSaver) SaveEnhancedCorpusEntry(
 			continue
 		}
 
-		// Inject _info into the test object
-		testObj["_info"] = metaJSON
+		// Start with existing _info if present (preserves EEST provenance)
+		mergedInfo := make(map[string]interface{})
+		if existingInfo, ok := testObj["_info"]; ok {
+			if err := json.Unmarshal(existingInfo, &mergedInfo); err != nil {
+				// Existing _info is invalid, start fresh
+				mergedInfo = make(map[string]interface{})
+			}
+		}
+
+		// Add cross-VM metadata fields
+		mergedInfo["generatedBy"] = meta.GeneratedBy
+		mergedInfo["traceHash"] = meta.TraceHash
+		mergedInfo["stateRoot"] = meta.StateRoot
+		mergedInfo["crossvmVersion"] = meta.CrossVMVersion
+		if meta.TraceLines > 0 {
+			mergedInfo["traceLines"] = meta.TraceLines
+		}
+		if meta.GeneratedAt != "" {
+			mergedInfo["generatedAt"] = meta.GeneratedAt
+		}
+		if meta.Version != "" {
+			mergedInfo["version"] = meta.Version
+		}
+		if meta.Fork != "" {
+			mergedInfo["fork"] = meta.Fork
+		}
+
+		// Marshal merged _info
+		mergedInfoJSON, err := json.Marshal(mergedInfo)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal merged _info for %s: %w", testName, err)
+		}
+		testObj["_info"] = mergedInfoJSON
 
 		// Re-marshal the test object
 		updatedTestRaw, err := json.Marshal(testObj)

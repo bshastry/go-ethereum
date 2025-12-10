@@ -313,7 +313,6 @@ func (bp *BatchProcessor) processFile(inputPath string) ProcessResult {
 func (bp *BatchProcessor) writeOutput(inputPath string, data []byte, traceResult *TracingResult) (string, error) {
 	// Build metadata
 	meta := &CrossVMMetadata{
-		Comment:        CrossVMDefaultComment,
 		GeneratedBy:    "geth",
 		TraceHash:      traceResult.TraceHash,
 		StateRoot:      traceResult.StateRoot,

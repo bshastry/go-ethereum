@@ -37,7 +37,6 @@ func TestInjectCrossVMMetadata(t *testing.T) {
 }`)
 
 	meta := &CrossVMMetadata{
-		Comment:        "Test comment",
 		GeneratedBy:    "geth",
 		TraceHash:      "abc123def456",
 		StateRoot:      "0xdeadbeef",

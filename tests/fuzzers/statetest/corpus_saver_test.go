@@ -118,9 +118,6 @@ func TestSaveEnhancedCorpusEntry_EESTFormat(t *testing.T) {
 	if meta.CrossVMVersion != CrossVMMetadataVersion {
 		t.Errorf("expected crossvmVersion='%s', got '%s'", CrossVMMetadataVersion, meta.CrossVMVersion)
 	}
-	if meta.Comment != CrossVMDefaultComment {
-		t.Errorf("expected comment='%s', got '%s'", CrossVMDefaultComment, meta.Comment)
-	}
 	if meta.TraceLines != traceResult.TraceLines {
 		t.Errorf("expected traceLines=%d, got %d", traceResult.TraceLines, meta.TraceLines)
 	}
@@ -518,14 +515,6 @@ func TestCrossVMMetadataVersion(t *testing.T) {
 	}
 }
 
-// TestCrossVMDefaultComment verifies the default comment constant.
-func TestCrossVMDefaultComment(t *testing.T) {
-	expected := "Cross-VM consensus verification test"
-	if CrossVMDefaultComment != expected {
-		t.Errorf("expected CrossVMDefaultComment='%s', got '%s'", expected, CrossVMDefaultComment)
-	}
-}
-
 // TestEESTFormatJSONStructure verifies the exact JSON structure matches EEST spec.
 func TestEESTFormatJSONStructure(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "statetest-corpus-*")
@@ -563,9 +552,8 @@ func TestEESTFormatJSONStructure(t *testing.T) {
 		t.Error("saved JSON should contain '_info' key")
 	}
 
-	// Should have required fields
+	// Should have required cross-VM fields (comment is preserved from original, not generated)
 	requiredFields := []string{
-		`"comment"`,
 		`"generatedBy"`,
 		`"traceHash"`,
 		`"stateRoot"`,
