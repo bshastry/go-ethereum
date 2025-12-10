@@ -96,6 +96,10 @@ type CoverageCorpus struct {
 	// Pick tracking (atomic counters)
 	hpPicks   int64 // Times high priority queue was selected
 	seedPicks int64 // Times seeds were selected (round-robin)
+
+	// Splice donor tracking
+	spliceCoverageDonors int64 // Times splicingPool was selected as donor
+	spliceSeedDonors     int64 // Times seeds were selected as donor
 }
 
 // CoverageCorpusOption is a functional option for configuring CoverageCorpus
@@ -235,25 +239,42 @@ func (c *CoverageCorpus) AddHighPriority(input *PriorityInput) {
 	}
 }
 
-// GetRandomInput implements mutations.CorpusProvider for splicing strategy
+// GetRandomInput implements mutations.CorpusProvider for splicing strategy.
+// Uses weighted sampling: 70% splicingPool, 30% seeds when both are available.
+// This ensures expert EEST seeds remain in play even after coverage-finding inputs exist.
 func (c *CoverageCorpus) GetRandomInput() ([]byte, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// Prefer splicing pool if available (coverage-finding inputs)
-	if len(c.splicingPool) > 0 {
-		input := c.splicingPool[c.rng.Intn(len(c.splicingPool))]
-		result := make([]byte, len(input))
-		copy(result, input)
-		return result, nil
-	}
+	hasSplicingPool := len(c.splicingPool) > 0
+	hasSeeds := len(c.normalSeeds) > 0
 
-	// Fall back to normal seeds
-	if len(c.normalSeeds) == 0 {
+	// Handle cases where only one source is available
+	if !hasSplicingPool && !hasSeeds {
 		return nil, ErrNoCorpus
 	}
 
-	input := c.normalSeeds[c.rng.Intn(len(c.normalSeeds))]
+	var input []byte
+	if hasSplicingPool && hasSeeds {
+		// Both available: 70% splicingPool, 30% seeds
+		if c.rng.Intn(100) < 70 {
+			c.spliceCoverageDonors++
+			input = c.splicingPool[c.rng.Intn(len(c.splicingPool))]
+		} else {
+			c.spliceSeedDonors++
+			input = c.normalSeeds[c.rng.Intn(len(c.normalSeeds))]
+		}
+	} else if hasSplicingPool {
+		// Only splicingPool available
+		c.spliceCoverageDonors++
+		input = c.splicingPool[c.rng.Intn(len(c.splicingPool))]
+	} else {
+		// Only seeds available
+		c.spliceSeedDonors++
+		input = c.normalSeeds[c.rng.Intn(len(c.normalSeeds))]
+	}
+
+	// Return a copy to prevent external modification
 	result := make([]byte, len(input))
 	copy(result, input)
 	return result, nil
@@ -283,6 +304,10 @@ type CoverageCorpusStats struct {
 	TotalAdded   int64 // Total inputs ever added to HP queue
 	MaxCoverage  float64
 	LastFindTime time.Time
+
+	// Splice donor tracking
+	SpliceCoverageDonors int64 // Times splicingPool was selected as splice donor
+	SpliceSeedDonors     int64 // Times seeds were selected as splice donor
 }
 
 // FullStats returns detailed corpus statistics
@@ -290,14 +315,16 @@ func (c *CoverageCorpus) FullStats() CoverageCorpusStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return CoverageCorpusStats{
-		HPQueueLen:   len(c.highPriority),
-		SplicingLen:  len(c.splicingPool),
-		SeedCount:    len(c.normalSeeds),
-		HPPicks:      c.hpPicks,
-		SeedPicks:    c.seedPicks,
-		TotalAdded:   c.totalInputsAdded,
-		MaxCoverage:  c.maxCoverage,
-		LastFindTime: c.lastFindTime,
+		HPQueueLen:           len(c.highPriority),
+		SplicingLen:          len(c.splicingPool),
+		SeedCount:            len(c.normalSeeds),
+		HPPicks:              c.hpPicks,
+		SeedPicks:            c.seedPicks,
+		TotalAdded:           c.totalInputsAdded,
+		MaxCoverage:          c.maxCoverage,
+		LastFindTime:         c.lastFindTime,
+		SpliceCoverageDonors: c.spliceCoverageDonors,
+		SpliceSeedDonors:     c.spliceSeedDonors,
 	}
 }
 

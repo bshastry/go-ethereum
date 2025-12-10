@@ -946,6 +946,14 @@ func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 				}
 				t.Logf(" CORPUS: seeds=%d hp_q=%d(added=%d) splice=%d | HP_PICKS: %d (%.1f%%) SEED_PICKS: %d",
 					cs.SeedCount, cs.HPQueueLen, cs.TotalAdded, cs.SplicingLen, cs.HPPicks, hpRatio, cs.SeedPicks)
+
+				// Show splice donor distribution (only if splicing is active)
+				totalDonors := cs.SpliceCoverageDonors + cs.SpliceSeedDonors
+				if totalDonors > 0 {
+					covDonorRatio := float64(cs.SpliceCoverageDonors) / float64(totalDonors) * 100
+					t.Logf(" SPLICE_DONORS: coverage=%d (%.1f%%) seeds=%d (%.1f%%)",
+						cs.SpliceCoverageDonors, covDonorRatio, cs.SpliceSeedDonors, 100-covDonorRatio)
+				}
 			}
 
 			t.Logf("═══════════════════════════════════════════════════════════════════")
@@ -1047,6 +1055,17 @@ func printFinalReportAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 			t.Logf("   - HP pick ratio: %.1f%% (target: 80%%)", float64(cs.HPPicks)/float64(totalPicks)*100)
 		}
 		t.Logf("   - Total added to HP: %d", cs.TotalAdded)
+
+		// Splice donor distribution
+		totalDonors := cs.SpliceCoverageDonors + cs.SpliceSeedDonors
+		if totalDonors > 0 {
+			t.Logf("")
+			t.Logf("Splice donor distribution:")
+			t.Logf("   - Coverage donors: %d (%.1f%%)", cs.SpliceCoverageDonors,
+				float64(cs.SpliceCoverageDonors)/float64(totalDonors)*100)
+			t.Logf("   - Seed donors: %d (%.1f%%) (target: 30%%)", cs.SpliceSeedDonors,
+				float64(cs.SpliceSeedDonors)/float64(totalDonors)*100)
+		}
 	}
 }
 
