@@ -16,6 +16,10 @@ A high-performance, coverage-guided fuzzer for Ethereum state tests, ported from
 ### Basic Run (2 minutes)
 
 ```bash
+# Using the convenience script (recommended - includes EVM coverage by default)
+./tests/fuzzers/statetest/fuzz.sh
+
+# Or manually
 go test -cover -run=TestFuzzStateTestCustomMutator -v ./tests/fuzzers/statetest/
 ```
 
@@ -35,6 +39,81 @@ FUZZ_SEED_DIR=$(pwd)/../goevmlab/corpus go test -cover -run=TestFuzzStateTestCus
 
 ```bash
 FUZZ_DURATION=24h FUZZ_WORKERS=32 go test -cover -run=TestFuzzStateTestCustomMutator -v ./tests/fuzzers/statetest/ -timeout=25h
+```
+
+### Coverage-Guided Fuzzing (Recommended)
+
+**Important:** By default, `-cover` only tracks coverage of the fuzzer package itself. To track meaningful EVM coverage, use `-coverpkg` to include the packages being fuzzed:
+
+```bash
+# Recommended packages for EVM state test fuzzing
+COVERPKG="github.com/ethereum/go-ethereum/core/vm,\
+github.com/ethereum/go-ethereum/core/state,\
+github.com/ethereum/go-ethereum/core,\
+github.com/ethereum/go-ethereum/core/types,\
+github.com/ethereum/go-ethereum/crypto"
+
+# Full command with EVM coverage tracking
+FUZZ_DURATION=1h FUZZ_WORKERS=22 \
+FUZZ_SEED_DIR=$(pwd)/../goevmlab/corpus \
+FUZZ_CORPUS_DIR=$(pwd)/out-$(date -I) \
+go test -cover -coverpkg=$COVERPKG \
+  -run=TestFuzzStateTestCustomMutator -v \
+  ./tests/fuzzers/statetest/ -timeout=2h
+```
+
+**Package coverage guide:**
+
+| Package | What it covers |
+|---------|---------------|
+| `core/vm` | EVM interpreter, opcodes, precompiles, gas metering |
+| `core/state` | State database, account storage, trie operations |
+| `core` | Block processing, state transitions, consensus |
+| `core/types` | Transaction types, receipts, logs |
+| `crypto` | ECDSA, keccak256, secp256k1, bn256 precompiles |
+
+**Additional packages for specific testing:**
+
+```bash
+# For blob transaction testing (Cancun+)
+COVERPKG="$COVERPKG,github.com/ethereum/go-ethereum/crypto/kzg4844"
+
+# For precompile testing (geth's wrappers)
+COVERPKG="$COVERPKG,github.com/ethereum/go-ethereum/crypto/bn256,github.com/ethereum/go-ethereum/crypto/blake2b,github.com/ethereum/go-ethereum/crypto/secp256k1"
+```
+
+**External crypto packages:** Go 1.20+ supports instrumenting external dependencies. The `fuzz.sh` script automatically includes key crypto libraries:
+- `gnark-crypto/ecc/bls12-381` - BLS12-381 precompiles (EIP-2537)
+- `gnark-crypto/ecc/bn254` - BN254/alt_bn128 precompiles (ecAdd, ecMul, ecPairing)
+
+### A/B Testing Mode (Mutation vs Generation)
+
+For comparing mutation-based and generation-based fuzzing effectiveness:
+
+```bash
+# Using convenience script
+./tests/fuzzers/statetest/fuzz.sh --ab --duration 1h --seed-dir $(pwd)/../goevmlab/corpus
+
+# Or manually
+FUZZ_DURATION=1h FUZZ_MUTATION_RATIO=0.5 FUZZ_FORK=Osaka \
+FUZZ_SEED_DIR=$(pwd)/../goevmlab/corpus \
+FUZZ_CORPUS_DIR=$(pwd)/out-$(date -I) \
+FUZZ_WORKERS=22 FUZZ_PROVIDER=hybrid \
+go test -cover -coverpkg=$COVERPKG \
+  -tags=generators -run=TestFuzzStateTestAB \
+  ./tests/fuzzers/statetest/ -timeout=2h -v
+```
+
+### Convenience Script Reference
+
+The `fuzz.sh` script provides sensible defaults and automatically includes EVM coverage packages:
+
+```bash
+./fuzz.sh                              # Basic 2-minute run with EVM coverage
+./fuzz.sh --ab                         # A/B testing mode
+./fuzz.sh --duration 1h --workers 32   # Extended run
+./fuzz.sh --seed-dir /path/to/corpus   # Custom seed corpus
+./fuzz.sh --help                       # Show all options
 ```
 
 ## Configuration
