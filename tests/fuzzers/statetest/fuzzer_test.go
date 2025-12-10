@@ -936,6 +936,18 @@ func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 				t.Logf(" TOP_SOURCES: %s", strings.Join(topSources, ", "))
 			}
 
+			// Show corpus stats if provider has one
+			if cp, ok := provider.(CorpusProvider); ok {
+				cs := cp.Corpus().FullStats()
+				totalPicks := cs.HPPicks + cs.SeedPicks
+				var hpRatio float64
+				if totalPicks > 0 {
+					hpRatio = float64(cs.HPPicks) / float64(totalPicks) * 100
+				}
+				t.Logf(" CORPUS: seeds=%d hp_q=%d(added=%d) splice=%d | HP_PICKS: %d (%.1f%%) SEED_PICKS: %d",
+					cs.SeedCount, cs.HPQueueLen, cs.TotalAdded, cs.SplicingLen, cs.HPPicks, hpRatio, cs.SeedPicks)
+			}
+
 			t.Logf("═══════════════════════════════════════════════════════════════════")
 
 		case <-stats.done:
@@ -1021,6 +1033,20 @@ func printFinalReportAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 		t.Logf("Coverage guidance stats:")
 		t.Logf("   - Avg execs per find: %.0f", float64(execs)/float64(covFinds))
 		t.Logf("   - Avg delta per find: %.6f%%", provStats.AvgDeltaPerFind()*100)
+	}
+
+	// Corpus stats if available
+	if cp, ok := provider.(CorpusProvider); ok {
+		cs := cp.Corpus().FullStats()
+		totalPicks := cs.HPPicks + cs.SeedPicks
+		t.Logf("")
+		t.Logf("Corpus pick distribution:")
+		t.Logf("   - Seeds: %d  HP queue: %d  Splicing pool: %d", cs.SeedCount, cs.HPQueueLen, cs.SplicingLen)
+		t.Logf("   - HP picks: %d  Seed picks: %d  Total: %d", cs.HPPicks, cs.SeedPicks, totalPicks)
+		if totalPicks > 0 {
+			t.Logf("   - HP pick ratio: %.1f%% (target: 80%%)", float64(cs.HPPicks)/float64(totalPicks)*100)
+		}
+		t.Logf("   - Total added to HP: %d", cs.TotalAdded)
 	}
 }
 

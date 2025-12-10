@@ -26,6 +26,12 @@ import (
 // ErrProviderExhausted is returned when a provider has no more inputs.
 var ErrProviderExhausted = errors.New("provider exhausted")
 
+// CorpusProvider is an optional interface for providers that have an underlying corpus.
+// This allows the UI to display corpus-level statistics (queue depth, pick ratios, etc.).
+type CorpusProvider interface {
+	Corpus() *CoverageCorpus
+}
+
 // InputProvider abstracts the source of fuzz inputs.
 // This allows swapping between mutation-based, generation-based, or hybrid approaches.
 // Implementations must be thread-safe for concurrent worker access.

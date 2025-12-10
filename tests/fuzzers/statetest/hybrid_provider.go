@@ -269,3 +269,8 @@ func (p *HybridProvider) GenerationStats() (inputs, finds int64, delta float64) 
 	p.mu.Unlock()
 	return atomic.LoadInt64(&p.genInputs), atomic.LoadInt64(&p.genFinds), delta
 }
+
+// Corpus returns the underlying corpus for stats access.
+func (p *HybridProvider) Corpus() *CoverageCorpus {
+	return p.corpus
+}

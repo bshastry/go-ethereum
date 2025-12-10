@@ -92,6 +92,10 @@ type CoverageCorpus struct {
 	maxCoverage      float64   // Maximum coverage achieved
 	totalInputsAdded int64     // Total inputs added to high priority
 	lastFindTime     time.Time // Time of last coverage find
+
+	// Pick tracking (atomic counters)
+	hpPicks   int64 // Times high priority queue was selected
+	seedPicks int64 // Times seeds were selected (round-robin)
 }
 
 // CoverageCorpusOption is a functional option for configuring CoverageCorpus
@@ -159,6 +163,7 @@ func (c *CoverageCorpus) Pop() []byte {
 	useHighPriority := len(c.highPriority) > 0 && c.rng.Float64() < c.highPriorityP
 
 	if useHighPriority {
+		c.hpPicks++
 		item := heap.Pop(&c.highPriority).(*PriorityInput)
 		// Return a copy to prevent external modification
 		result := make([]byte, len(item.Data))
@@ -171,6 +176,7 @@ func (c *CoverageCorpus) Pop() []byte {
 		return nil
 	}
 
+	c.seedPicks++
 	input := c.normalSeeds[c.seedIndex%len(c.normalSeeds)]
 	c.seedIndex++
 
@@ -260,11 +266,39 @@ func (c *CoverageCorpus) GetInputCount() int {
 	return len(c.splicingPool) + len(c.normalSeeds)
 }
 
-// Stats returns corpus statistics
+// Stats returns corpus statistics (legacy interface)
 func (c *CoverageCorpus) Stats() (highPriorityLen, splicingPoolLen int, maxCov float64, lastFind time.Time) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.highPriority), len(c.splicingPool), c.maxCoverage, c.lastFindTime
+}
+
+// CoverageCorpusStats contains detailed runtime statistics for the coverage corpus
+type CoverageCorpusStats struct {
+	HPQueueLen   int   // Current high priority queue length
+	SplicingLen  int   // Current splicing pool size
+	SeedCount    int   // Number of original seeds
+	HPPicks      int64 // Times HP queue was selected
+	SeedPicks    int64 // Times seeds were selected
+	TotalAdded   int64 // Total inputs ever added to HP queue
+	MaxCoverage  float64
+	LastFindTime time.Time
+}
+
+// FullStats returns detailed corpus statistics
+func (c *CoverageCorpus) FullStats() CoverageCorpusStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return CoverageCorpusStats{
+		HPQueueLen:   len(c.highPriority),
+		SplicingLen:  len(c.splicingPool),
+		SeedCount:    len(c.normalSeeds),
+		HPPicks:      c.hpPicks,
+		SeedPicks:    c.seedPicks,
+		TotalAdded:   c.totalInputsAdded,
+		MaxCoverage:  c.maxCoverage,
+		LastFindTime: c.lastFindTime,
+	}
 }
 
 // SeedCount returns the number of original seeds
