@@ -17,7 +17,8 @@
 package statetest
 
 import (
-	"container/heap"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"math/rand"
 	"sync"
@@ -30,14 +31,18 @@ var ErrNoCorpus = errors.New("corpus is empty")
 // PriorityInput represents a fuzz input with coverage metadata
 type PriorityInput struct {
 	Data           []byte    // The actual test data
-	Priority       int       // Higher = more important (scaled from coverage delta)
+	Priority       int       // Current priority (decays over time)
+	BasePriority   int       // Original priority at discovery
 	CoverageDelta  float64   // How much coverage this input added
 	DiscoveredAt   time.Time // When this input was discovered
 	ParentStrategy string    // Which mutation strategy created this
-	index          int       // Heap index for efficient updates
+	PickCount      int64     // Times this input was picked
+	LastPickTime   time.Time // When last picked
+	dataHash       string    // SHA256 hash for O(1) lookup (internal)
 }
 
 // PriorityHeap implements heap.Interface for priority-based scheduling
+// NOTE: Kept for backward compatibility but no longer used by CoverageCorpus
 type PriorityHeap []*PriorityInput
 
 func (h PriorityHeap) Len() int { return len(h) }
@@ -48,14 +53,10 @@ func (h PriorityHeap) Less(i, j int) bool { return h[i].Priority > h[j].Priority
 
 func (h PriorityHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
-	h[i].index = i
-	h[j].index = j
 }
 
 func (h *PriorityHeap) Push(x any) {
-	n := len(*h)
 	item := x.(*PriorityInput)
-	item.index = n
 	*h = append(*h, item)
 }
 
@@ -63,8 +64,7 @@ func (h *PriorityHeap) Pop() any {
 	old := *h
 	n := len(old)
 	item := old[n-1]
-	old[n-1] = nil  // Avoid memory leak
-	item.index = -1 // Mark as removed
+	old[n-1] = nil // Avoid memory leak
 	*h = old[0 : n-1]
 	return item
 }
@@ -72,10 +72,15 @@ func (h *PriorityHeap) Pop() any {
 // CoverageCorpus manages inputs with coverage-guided prioritization.
 // It implements the mutations.CorpusProvider interface for splicing support.
 type CoverageCorpus struct {
-	mu           sync.RWMutex
-	highPriority PriorityHeap // Heap ordered by priority (coverage delta)
-	normalSeeds  [][]byte     // Original seed corpus (round-robin)
-	seedIndex    int          // Current position in normalSeeds
+	mu sync.RWMutex
+
+	// HP queue - simple slice with retention (items stay in queue after Pop)
+	hpQueue       []*PriorityInput          // All high-priority inputs
+	hpIndex       map[string]*PriorityInput // dataHash -> item for O(1) lookup
+	totalPriority int64                     // Running sum for weighted selection
+
+	normalSeeds [][]byte // Original seed corpus (round-robin)
+	seedIndex   int      // Current position in normalSeeds
 
 	// Splicing corpus - all inputs that found coverage
 	splicingPool [][]byte
@@ -88,10 +93,17 @@ type CoverageCorpus struct {
 	highPriorityP  float64 // Probability of picking from high priority queue
 	maxSplicingLen int     // Maximum splicing pool size
 
+	// Retention config
+	decayRate     float64 // Priority decay per pick (default: 0.95)
+	minPriority   int     // Cull threshold (default: 100)
+	cullInterval  int     // Cull every N pops (default: 1000)
+	popsSinceCull int     // Counter for inline culling
+
 	// Stats
 	maxCoverage      float64   // Maximum coverage achieved
 	totalInputsAdded int64     // Total inputs added to high priority
 	lastFindTime     time.Time // Time of last coverage find
+	totalCulled      int64     // Total items ever culled
 
 	// Pick tracking (atomic counters)
 	hpPicks   int64 // Times high priority queue was selected
@@ -128,16 +140,51 @@ func WithMaxSplicingPoolSize(size int) CoverageCorpusOption {
 	}
 }
 
+// WithDecayRate sets the priority decay rate per pick (0 < rate <= 1)
+func WithDecayRate(rate float64) CoverageCorpusOption {
+	return func(c *CoverageCorpus) {
+		if rate > 0 && rate <= 1 {
+			c.decayRate = rate
+		}
+	}
+}
+
+// WithMinPriority sets the minimum priority threshold for culling
+func WithMinPriority(min int) CoverageCorpusOption {
+	return func(c *CoverageCorpus) {
+		if min >= 0 {
+			c.minPriority = min
+		}
+	}
+}
+
+// WithCullInterval sets how often culling occurs (every N pops)
+func WithCullInterval(interval int) CoverageCorpusOption {
+	return func(c *CoverageCorpus) {
+		if interval > 0 {
+			c.cullInterval = interval
+		}
+	}
+}
+
 // NewCoverageCorpus creates a corpus with initial seeds
 func NewCoverageCorpus(seeds [][]byte, opts ...CoverageCorpusOption) *CoverageCorpus {
 	c := &CoverageCorpus{
+		hpQueue:        make([]*PriorityInput, 0),
+		hpIndex:        make(map[string]*PriorityInput),
+		totalPriority:  0,
 		normalSeeds:    make([][]byte, len(seeds)),
 		splicingPool:   make([][]byte, 0, 1000),
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
-		maxQueueSize:   10000,  // Default max queue size
-		highPriorityP:  0.8,    // 80% chance to pick high priority
-		maxSplicingLen: 10000,  // Default max splicing pool
+		maxQueueSize:   10000, // Default max queue size
+		highPriorityP:  0.8,   // 80% chance to pick high priority
+		maxSplicingLen: 10000, // Default max splicing pool
+		decayRate:      0.95,  // Default decay rate
+		minPriority:    100,   // Default cull threshold
+		cullInterval:   1000,  // Default cull every 1000 pops
+		popsSinceCull:  0,
 		lastFindTime:   time.Now(),
+		totalCulled:    0,
 	}
 
 	// Copy seeds to prevent external modification
@@ -145,9 +192,6 @@ func NewCoverageCorpus(seeds [][]byte, opts ...CoverageCorpusOption) *CoverageCo
 		c.normalSeeds[i] = make([]byte, len(seed))
 		copy(c.normalSeeds[i], seed)
 	}
-
-	// Initialize the heap
-	heap.Init(&c.highPriority)
 
 	// Apply options
 	for _, opt := range opts {
@@ -158,21 +202,38 @@ func NewCoverageCorpus(seeds [][]byte, opts ...CoverageCorpusOption) *CoverageCo
 }
 
 // Pop returns the next input to fuzz (high priority first, then round-robin seeds).
+// Items remain in the HP queue after being picked (retention).
 // Returns nil if corpus is completely empty.
 func (c *CoverageCorpus) Pop() []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Inline culling check
+	c.popsSinceCull++
+	if c.popsSinceCull >= c.cullInterval {
+		c.cullLocked()
+		c.popsSinceCull = 0
+	}
+
 	// Decide whether to use high priority queue
-	useHighPriority := len(c.highPriority) > 0 && c.rng.Float64() < c.highPriorityP
+	useHighPriority := len(c.hpQueue) > 0 && c.rng.Float64() < c.highPriorityP
 
 	if useHighPriority {
 		c.hpPicks++
-		item := heap.Pop(&c.highPriority).(*PriorityInput)
-		// Return a copy to prevent external modification
-		result := make([]byte, len(item.Data))
-		copy(result, item.Data)
-		return result
+		item := c.weightedSelectLocked()
+		if item != nil {
+			// Update pick stats
+			item.PickCount++
+			item.LastPickTime = time.Now()
+
+			// Apply decay
+			c.applyDecayLocked(item)
+
+			// Return a copy to prevent external modification
+			result := make([]byte, len(item.Data))
+			copy(result, item.Data)
+			return result
+		}
 	}
 
 	// Fall back to normal seeds (round-robin)
@@ -190,36 +251,154 @@ func (c *CoverageCorpus) Pop() []byte {
 	return result
 }
 
+// weightedSelectLocked selects an item with probability proportional to priority.
+// MUST be called with c.mu held.
+func (c *CoverageCorpus) weightedSelectLocked() *PriorityInput {
+	if len(c.hpQueue) == 0 || c.totalPriority <= 0 {
+		return nil
+	}
+
+	// Weighted random selection using running totalPriority
+	target := c.rng.Int63n(c.totalPriority)
+	var cumulative int64
+	for _, item := range c.hpQueue {
+		cumulative += int64(item.Priority)
+		if cumulative > target {
+			return item
+		}
+	}
+
+	// Fallback (shouldn't happen if totalPriority is accurate)
+	return c.hpQueue[len(c.hpQueue)-1]
+}
+
+// applyDecayLocked reduces an item's priority. MUST be called with c.mu held.
+func (c *CoverageCorpus) applyDecayLocked(item *PriorityInput) {
+	oldPriority := item.Priority
+	newPriority := int(float64(item.Priority) * c.decayRate)
+	if newPriority < c.minPriority {
+		newPriority = c.minPriority
+	}
+
+	// Update running sum
+	c.totalPriority -= int64(oldPriority)
+	c.totalPriority += int64(newPriority)
+	item.Priority = newPriority
+}
+
+// cullLocked removes items below minPriority. MUST be called with c.mu held.
+func (c *CoverageCorpus) cullLocked() int {
+	if len(c.hpQueue) == 0 {
+		return 0
+	}
+
+	newQueue := make([]*PriorityInput, 0, len(c.hpQueue))
+	culled := 0
+
+	for _, item := range c.hpQueue {
+		if item.Priority > c.minPriority {
+			newQueue = append(newQueue, item)
+		} else {
+			// Remove from index
+			delete(c.hpIndex, item.dataHash)
+			c.totalPriority -= int64(item.Priority)
+			culled++
+		}
+	}
+
+	c.hpQueue = newQueue
+	c.totalCulled += int64(culled)
+	return culled
+}
+
+// boostPriorityLocked increases an existing item's priority. MUST be called with c.mu held.
+func (c *CoverageCorpus) boostPriorityLocked(item *PriorityInput, coverageDelta float64) {
+	oldPriority := item.Priority
+	boost := int(coverageDelta * 1000000)
+	newPriority := item.BasePriority + boost
+
+	c.totalPriority -= int64(oldPriority)
+	c.totalPriority += int64(newPriority)
+
+	item.Priority = newPriority
+	item.CoverageDelta += coverageDelta
+}
+
+// replaceLowestLocked replaces the lowest priority item with a new one.
+// MUST be called with c.mu held.
+func (c *CoverageCorpus) replaceLowestLocked(newItem *PriorityInput) {
+	if len(c.hpQueue) == 0 {
+		return
+	}
+
+	// Find the lowest priority item
+	lowestIdx := 0
+	lowestPriority := c.hpQueue[0].Priority
+	for i, item := range c.hpQueue {
+		if item.Priority < lowestPriority {
+			lowestIdx = i
+			lowestPriority = item.Priority
+		}
+	}
+
+	// Only replace if new item has higher priority
+	if newItem.Priority > lowestPriority {
+		oldItem := c.hpQueue[lowestIdx]
+
+		// Update totalPriority
+		c.totalPriority -= int64(oldItem.Priority)
+		c.totalPriority += int64(newItem.Priority)
+
+		// Remove old from index, add new
+		delete(c.hpIndex, oldItem.dataHash)
+		c.hpIndex[newItem.dataHash] = newItem
+
+		// Replace in slice
+		c.hpQueue[lowestIdx] = newItem
+	}
+}
+
 // AddHighPriority adds an input that found new coverage
 func (c *CoverageCorpus) AddHighPriority(input *PriorityInput) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Compute data hash
+	hash := sha256.Sum256(input.Data)
+	dataHash := hex.EncodeToString(hash[:])
+
+	// Check if already exists (boost priority instead of adding duplicate)
+	if existing, ok := c.hpIndex[dataHash]; ok {
+		c.boostPriorityLocked(existing, input.CoverageDelta)
+		return
+	}
+
 	// Make a copy of the data
 	dataCopy := make([]byte, len(input.Data))
 	copy(dataCopy, input.Data)
-	input.Data = dataCopy
 
-	// Add to priority queue
-	if c.maxQueueSize == 0 || len(c.highPriority) < c.maxQueueSize {
-		heap.Push(&c.highPriority, input)
+	// Create new item
+	newItem := &PriorityInput{
+		Data:           dataCopy,
+		Priority:       input.Priority,
+		BasePriority:   input.Priority,
+		CoverageDelta:  input.CoverageDelta,
+		DiscoveredAt:   input.DiscoveredAt,
+		ParentStrategy: input.ParentStrategy,
+		PickCount:      0,
+		LastPickTime:   time.Time{},
+		dataHash:       dataHash,
+	}
+
+	// Check queue size limit
+	if c.maxQueueSize > 0 && len(c.hpQueue) >= c.maxQueueSize {
+		// Replace lowest priority item
+		c.replaceLowestLocked(newItem)
 	} else {
-		// Queue is full - only add if this has higher priority than minimum
-		// Since this is a max-heap, we need to find the minimum manually
-		// For simplicity, we'll just pop the last item if this has higher priority
-		// than a random existing item
-		if len(c.highPriority) > 0 {
-			// Replace a random item with probability based on priority difference
-			randomIdx := c.rng.Intn(len(c.highPriority))
-			if input.Priority > c.highPriority[randomIdx].Priority {
-				// Remove the old item and add new one
-				old := c.highPriority[randomIdx]
-				c.highPriority[randomIdx] = input
-				input.index = randomIdx
-				heap.Fix(&c.highPriority, randomIdx)
-				old.index = -1
-			}
-		}
+		// Add to queue
+		c.hpQueue = append(c.hpQueue, newItem)
+		c.hpIndex[dataHash] = newItem
+		c.totalPriority += int64(newItem.Priority)
 	}
 
 	// Add to splicing pool
@@ -291,7 +470,7 @@ func (c *CoverageCorpus) GetInputCount() int {
 func (c *CoverageCorpus) Stats() (highPriorityLen, splicingPoolLen int, maxCov float64, lastFind time.Time) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return len(c.highPriority), len(c.splicingPool), c.maxCoverage, c.lastFindTime
+	return len(c.hpQueue), len(c.splicingPool), c.maxCoverage, c.lastFindTime
 }
 
 // CoverageCorpusStats contains detailed runtime statistics for the coverage corpus
@@ -307,15 +486,31 @@ type CoverageCorpusStats struct {
 
 	// Splice donor tracking
 	SpliceCoverageDonors int64 // Times splicingPool was selected as splice donor
-	SpliceSeedDonors     int64 // Times seeds were selected as splice donor
+	SpliceSeedDonors     int64 // Times seeds was selected as splice donor
+
+	// Retention stats
+	TotalPriority int64   // Current sum of all priorities
+	TotalCulled   int64   // Total items ever culled
+	AvgPickCount  float64 // Average picks per item in queue
 }
 
 // FullStats returns detailed corpus statistics
 func (c *CoverageCorpus) FullStats() CoverageCorpusStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	// Compute average pick count
+	var avgPickCount float64
+	if len(c.hpQueue) > 0 {
+		var totalPicks int64
+		for _, item := range c.hpQueue {
+			totalPicks += item.PickCount
+		}
+		avgPickCount = float64(totalPicks) / float64(len(c.hpQueue))
+	}
+
 	return CoverageCorpusStats{
-		HPQueueLen:           len(c.highPriority),
+		HPQueueLen:           len(c.hpQueue),
 		SplicingLen:          len(c.splicingPool),
 		SeedCount:            len(c.normalSeeds),
 		HPPicks:              c.hpPicks,
@@ -325,6 +520,9 @@ func (c *CoverageCorpus) FullStats() CoverageCorpusStats {
 		LastFindTime:         c.lastFindTime,
 		SpliceCoverageDonors: c.spliceCoverageDonors,
 		SpliceSeedDonors:     c.spliceSeedDonors,
+		TotalPriority:        c.totalPriority,
+		TotalCulled:          c.totalCulled,
+		AvgPickCount:         avgPickCount,
 	}
 }
 
@@ -359,9 +557,12 @@ func (c *CoverageCorpus) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.highPriority = make(PriorityHeap, 0)
-	heap.Init(&c.highPriority)
+	c.hpQueue = make([]*PriorityInput, 0)
+	c.hpIndex = make(map[string]*PriorityInput)
+	c.totalPriority = 0
 	c.splicingPool = make([][]byte, 0, 1000)
 	c.maxCoverage = 0
 	c.totalInputsAdded = 0
+	c.totalCulled = 0
+	c.popsSinceCull = 0
 }

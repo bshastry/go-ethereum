@@ -947,6 +947,12 @@ func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 				t.Logf(" CORPUS: seeds=%d hp_q=%d(added=%d) splice=%d | HP_PICKS: %d (%.1f%%) SEED_PICKS: %d",
 					cs.SeedCount, cs.HPQueueLen, cs.TotalAdded, cs.SplicingLen, cs.HPPicks, hpRatio, cs.SeedPicks)
 
+				// Show retention stats (only if HP queue has items)
+				if cs.HPQueueLen > 0 {
+					t.Logf(" RETENTION: avg_picks=%.1f culled=%d total_priority=%d",
+						cs.AvgPickCount, cs.TotalCulled, cs.TotalPriority)
+				}
+
 				// Show splice donor distribution (only if splicing is active)
 				totalDonors := cs.SpliceCoverageDonors + cs.SpliceSeedDonors
 				if totalDonors > 0 {
@@ -1055,6 +1061,15 @@ func printFinalReportAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 			t.Logf("   - HP pick ratio: %.1f%% (target: 80%%)", float64(cs.HPPicks)/float64(totalPicks)*100)
 		}
 		t.Logf("   - Total added to HP: %d", cs.TotalAdded)
+
+		// Retention stats
+		if cs.HPQueueLen > 0 || cs.TotalCulled > 0 {
+			t.Logf("")
+			t.Logf("Retention stats:")
+			t.Logf("   - Avg picks per item: %.1f", cs.AvgPickCount)
+			t.Logf("   - Total culled: %d", cs.TotalCulled)
+			t.Logf("   - Total priority sum: %d", cs.TotalPriority)
+		}
 
 		// Splice donor distribution
 		totalDonors := cs.SpliceCoverageDonors + cs.SpliceSeedDonors
