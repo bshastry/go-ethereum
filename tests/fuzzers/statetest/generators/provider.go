@@ -20,6 +20,7 @@ package generators
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -242,6 +243,7 @@ func (p *ProviderStats) AvgDeltaPerFind() float64 {
 }
 
 // TopSources returns the top N sources by coverage finds.
+// Excludes aggregate totals (entries with square brackets like [mutation_total]).
 func (p *ProviderStats) TopSources(n int) []string {
 	if len(p.SourceBreakdown) == 0 {
 		return nil
@@ -253,6 +255,10 @@ func (p *ProviderStats) TopSources(n int) []string {
 	}
 	sources := make([]sourceFind, 0, len(p.SourceBreakdown))
 	for name, stats := range p.SourceBreakdown {
+		// Skip aggregate totals (marked with square brackets)
+		if len(name) > 0 && name[0] == '[' {
+			continue
+		}
 		sources = append(sources, sourceFind{name, stats.CoverageFinds})
 	}
 
@@ -268,7 +274,7 @@ func (p *ProviderStats) TopSources(n int) []string {
 	}
 	result := make([]string, n)
 	for i := 0; i < n; i++ {
-		result[i] = sources[i].name
+		result[i] = fmt.Sprintf("%s(%d)", sources[i].name, sources[i].finds)
 	}
 	return result
 }

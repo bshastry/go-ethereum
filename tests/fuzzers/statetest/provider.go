@@ -18,6 +18,7 @@ package statetest
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -194,12 +195,52 @@ func (p *ProviderStats) AvgDeltaPerFind() float64 {
 }
 
 // TopSources returns the top N sources by coverage finds.
+// Excludes aggregate totals (entries with square brackets like [mutation_total]).
 func (p *ProviderStats) TopSources(n int) []string {
 	if len(p.SourceBreakdown) == 0 {
 		return nil
 	}
 
-	// Collect and sort by finds
+	// Collect and sort by finds, excluding aggregate totals
+	type sourceFind struct {
+		name  string
+		finds int64
+	}
+	sources := make([]sourceFind, 0, len(p.SourceBreakdown))
+	for name, stats := range p.SourceBreakdown {
+		// Skip aggregate totals (marked with square brackets)
+		if len(name) > 0 && name[0] == '[' {
+			continue
+		}
+		sources = append(sources, sourceFind{name, stats.CoverageFinds})
+	}
+
+	// Simple insertion sort (typically small N)
+	for i := 1; i < len(sources); i++ {
+		for j := i; j > 0 && sources[j].finds > sources[j-1].finds; j-- {
+			sources[j], sources[j-1] = sources[j-1], sources[j]
+		}
+	}
+
+	// Return top N names with find counts
+	if n > len(sources) {
+		n = len(sources)
+	}
+	result := make([]string, n)
+	for i := 0; i < n; i++ {
+		result[i] = fmt.Sprintf("%s(%d)", sources[i].name, sources[i].finds)
+	}
+	return result
+}
+
+// TopSourcesWithTotals returns the top N sources by coverage finds, including aggregate totals.
+// Returns raw source names (without find counts appended) for use in detailed reports.
+func (p *ProviderStats) TopSourcesWithTotals(n int) []string {
+	if len(p.SourceBreakdown) == 0 {
+		return nil
+	}
+
+	// Collect and sort by finds (including all sources)
 	type sourceFind struct {
 		name  string
 		finds int64
@@ -216,7 +257,7 @@ func (p *ProviderStats) TopSources(n int) []string {
 		}
 	}
 
-	// Return top N names
+	// Return top N names (raw, without counts)
 	if n > len(sources) {
 		n = len(sources)
 	}

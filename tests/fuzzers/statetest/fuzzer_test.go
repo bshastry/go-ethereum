@@ -921,7 +921,16 @@ func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 			t.Logf(" PROVIDER_FINDS: %d  SAVED: %d  FIND_RATE: %.4f%%",
 				provStats.CoverageFinds, corpusSaved, provStats.FindRate()*100)
 
-			// Show top sources if available
+			// Show mutation vs generation totals if available (for hybrid provider)
+			if mutStats, ok := provStats.SourceBreakdown["[mutation_total]"]; ok {
+				if genStats, ok := provStats.SourceBreakdown["[generation_total]"]; ok {
+					t.Logf(" MUT: %d/%d (%.2f%%)  GEN: %d/%d (%.2f%%)",
+						mutStats.CoverageFinds, mutStats.Inputs, mutStats.FindRate()*100,
+						genStats.CoverageFinds, genStats.Inputs, genStats.FindRate()*100)
+				}
+			}
+
+			// Show top individual sources if available (excludes aggregates)
 			topSources := provStats.TopSources(3)
 			if len(topSources) > 0 {
 				t.Logf(" TOP_SOURCES: %s", strings.Join(topSources, ", "))
@@ -979,8 +988,8 @@ func printFinalReportAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 		t.Logf("║                       SOURCE BREAKDOWN                            ║")
 		t.Logf("╠═══════════════════════════════════════════════════════════════════╣")
 
-		// Sort sources by coverage finds
-		topSources := provStats.TopSources(10)
+		// Sort all sources by coverage finds (including totals)
+		topSources := provStats.TopSourcesWithTotals(15)
 		for _, source := range topSources {
 			srcStats := provStats.SourceBreakdown[source]
 			if srcStats != nil && srcStats.Inputs > 0 {
