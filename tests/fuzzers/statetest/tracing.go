@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -159,8 +160,12 @@ func executeWithTracing(
 					false,
 					rawdb.HashScheme,
 				)
-				// Always capture stateRoot - even on validation failure, root contains
-				// the pre-state root which is needed for deterministic trace hashing
+				// For exception tests, RunNoVerify returns zero hash because it
+				// reverts state and never calls Commit(). We need to compute the
+				// intermediate root (pre-state root) for cross-VM metadata.
+				if root == (common.Hash{}) && st.StateDB != nil {
+					root = st.StateDB.IntermediateRoot(false)
+				}
 				result.StateRoot = root.Hex()
 
 				if st.StateDB != nil {
@@ -267,8 +272,12 @@ func ExecuteAndDumpTrace(testJSON []byte, timeout time.Duration, config *DumpTra
 					false,
 					rawdb.HashScheme,
 				)
-				// Always capture stateRoot - even on validation failure, root contains
-				// the pre-state root which is needed for deterministic trace hashing
+				// For exception tests, RunNoVerify returns zero hash because it
+				// reverts state and never calls Commit(). We need to compute the
+				// intermediate root (pre-state root) for cross-VM metadata.
+				if root == (common.Hash{}) && st.StateDB != nil {
+					root = st.StateDB.IntermediateRoot(false)
+				}
 				result.StateRoot = root.Hex()
 
 				if st.StateDB != nil {
