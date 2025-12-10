@@ -35,6 +35,13 @@ import (
 	"github.com/ethereum/go-ethereum/tests/fuzzers/statetest/mutations"
 )
 
+// lastFindInfo stores both time and strategy atomically to ensure consistency.
+// This avoids TOCTOU races where readers could see mismatched time/strategy pairs.
+type lastFindInfo struct {
+	Time     time.Time
+	Strategy string
+}
+
 // FuzzStats tracks fuzzer statistics
 type FuzzStats struct {
 	totalExecs      int64
@@ -53,8 +60,37 @@ type FuzzStats struct {
 	crashMu      sync.Mutex
 	done         chan struct{}
 
-	// For tracking last find time atomically
-	lastFindTime atomic.Value // time.Time
+	// lastFind tracks when and which strategy last improved coverage.
+	// Uses compound struct for atomic consistency between time and strategy.
+	lastFind atomic.Value // *lastFindInfo
+}
+
+// recordCoverageFind atomically records a coverage find with its strategy.
+func (s *FuzzStats) recordCoverageFind(strategy string) {
+	atomic.AddInt64(&s.coverageFinds, 1)
+	s.lastFind.Store(&lastFindInfo{
+		Time:     time.Now(),
+		Strategy: strategy,
+	})
+}
+
+// getLastFind returns the last coverage find info, or nil if none yet.
+func (s *FuzzStats) getLastFind() *lastFindInfo {
+	if info, ok := s.lastFind.Load().(*lastFindInfo); ok {
+		return info
+	}
+	return nil
+}
+
+// formatLastFind returns a formatted string for progress display.
+// Format: "12s (mutation:bytecode)" or "never (none)"
+func formatLastFind(stats *FuzzStats) string {
+	info := stats.getLastFind()
+	if info == nil {
+		return "never (none)"
+	}
+	duration := time.Since(info.Time).Round(time.Second).String()
+	return fmt.Sprintf("%s (%s)", duration, info.Strategy)
 }
 
 // logCrash logs a crash to disk
@@ -187,7 +223,7 @@ func TestFuzzStateTestCustomMutator(t *testing.T) {
 		crashLogFile: "fuzz_crashes.log",
 		done:         make(chan struct{}),
 	}
-	stats.lastFindTime.Store(time.Now())
+	// No initial lastFind - will show "never (none)" until first coverage find
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -258,6 +294,8 @@ func worker(
 			mutated = cleaned
 			strategyName = "original"
 		}
+		// Ensure consistent naming with provider-based strategies (prefix with mutation:)
+		fullStrategyName := "mutation:" + strategyName
 
 		// Execute with coverage tracking
 		completed, crashed, panicVal, coverageDelta := executeWithCoverageTracking(
@@ -277,8 +315,7 @@ func worker(
 
 		// Coverage-guided prioritization
 		if coverageDelta > 0 {
-			atomic.AddInt64(&stats.coverageFinds, 1)
-			stats.lastFindTime.Store(time.Now())
+			stats.recordCoverageFind(fullStrategyName)
 
 			// Get trace hash for cross-client comparison
 			tracingResult, tracingErr := ExecuteAndNormalize(mutated, testTimeout)
@@ -288,7 +325,7 @@ func worker(
 					mutated,
 					tracingResult,
 					coverageDelta,
-					strategyName,
+					fullStrategyName,
 				)
 				if saveErr == nil {
 					atomic.AddInt64(&stats.corpusSaved, 1)
@@ -301,7 +338,7 @@ func worker(
 				Priority:       int(coverageDelta * 1000000), // Scale for int comparison
 				CoverageDelta:  coverageDelta,
 				DiscoveredAt:   time.Now(),
-				ParentStrategy: strategyName,
+				ParentStrategy: fullStrategyName,
 			})
 		}
 	}
@@ -441,11 +478,8 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 			lastCoverage = currentCov
 			lastCoverageTime = time.Now()
 
-			// Time since last coverage find
-			sinceLastFind := "never"
-			if lastFind, ok := stats.lastFindTime.Load().(time.Time); ok {
-				sinceLastFind = time.Since(lastFind).Round(time.Second).String()
-			}
+			// Time and strategy since last coverage find (atomically consistent)
+			lastFindStr := formatLastFind(stats)
 
 			// Corpus stats
 			hpQueueLen, splicingLen, _, _ := corpus.Stats()
@@ -463,7 +497,7 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 			t.Logf(" EXEC: %d (%.0f/s)  CRASH: %d  TIMEOUT: %d",
 				execs, rate, crashes, timeouts)
 			t.Logf(" COV:  %.3f%%  FINDS: %d  LAST: %s  GROWTH: %+.4f%%/min",
-				currentCov, covFinds, sinceLastFind, growthRate)
+				currentCov, covFinds, lastFindStr, growthRate)
 			t.Logf(" SEEDS: %d  HP_QUEUE: %d  SPLICING: %d  SAVED: %d",
 				seedCount, hpQueueLen, splicingLen, corpusSaved)
 			if crossVMVerified > 0 || crossVMFailed > 0 {
@@ -765,7 +799,7 @@ func TestFuzzStateTestAB(t *testing.T) {
 		crashLogFile: "fuzz_crashes.log",
 		done:         make(chan struct{}),
 	}
-	stats.lastFindTime.Store(time.Now())
+	// No initial lastFind - will show "never (none)" until first coverage find
 
 	// Start workers using InputProvider
 	var wg sync.WaitGroup
@@ -846,8 +880,7 @@ func workerWithProvider(
 
 		// Coverage-guided actions
 		if coverageDelta > 0 {
-			atomic.AddInt64(&stats.coverageFinds, 1)
-			stats.lastFindTime.Store(time.Now())
+			stats.recordCoverageFind(source)
 
 			// Get trace hash for cross-client comparison
 			tracingResult, tracingErr := ExecuteAndNormalize(input, testTimeout)
@@ -899,11 +932,8 @@ func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 			lastCoverage = currentCov
 			lastCoverageTime = time.Now()
 
-			// Time since last coverage find
-			sinceLastFind := "never"
-			if lastFind, ok := stats.lastFindTime.Load().(time.Time); ok {
-				sinceLastFind = time.Since(lastFind).Round(time.Second).String()
-			}
+			// Time and strategy since last coverage find (atomically consistent)
+			lastFindStr := formatLastFind(stats)
 
 			// Provider stats
 			provStats := provider.Stats()
@@ -917,7 +947,7 @@ func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 			t.Logf(" EXEC: %d (%.0f/s)  CRASH: %d  TIMEOUT: %d",
 				execs, rate, crashes, timeouts)
 			t.Logf(" COV:  %.3f%%  FINDS: %d  LAST: %s  GROWTH: %+.4f%%/min",
-				currentCov, covFinds, sinceLastFind, growthRate)
+				currentCov, covFinds, lastFindStr, growthRate)
 			t.Logf(" PROVIDER_FINDS: %d  SAVED: %d  FIND_RATE: %.4f%%",
 				provStats.CoverageFinds, corpusSaved, provStats.FindRate()*100)
 
@@ -1103,4 +1133,103 @@ func parseFloatOrDefault(key string, defaultVal float64) float64 {
 // parseBoolOrDefault parses a bool from environment or returns default.
 func parseBoolOrDefault(key string, defaultVal bool) bool {
 	return ParseBoolOrDefault(key, defaultVal)
+}
+
+// TestLastFindInfoConcurrency validates that lastFindInfo operations are thread-safe.
+// This test verifies the atomicity guarantees documented in the PRD.
+func TestLastFindInfoConcurrency(t *testing.T) {
+	stats := &FuzzStats{
+		startTime: time.Now(),
+		done:      make(chan struct{}),
+	}
+
+	strategies := []string{
+		"mutation:bytecode",
+		"mutation:havoc",
+		"mutation:splicing",
+		"generation:ecrecover",
+		"generation:bn254",
+	}
+
+	const numWriters = 100
+	const writesPerWriter = 1000
+
+	var wg sync.WaitGroup
+
+	// Start many concurrent writers
+	for i := 0; i < numWriters; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < writesPerWriter; j++ {
+				strategy := strategies[workerID%len(strategies)]
+				stats.recordCoverageFind(strategy)
+			}
+		}(i)
+	}
+
+	// Concurrent reader that validates consistency
+	done := make(chan struct{})
+	readerErrors := make(chan error, 100)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				info := stats.getLastFind()
+				if info != nil {
+					// Validate that strategy is non-empty
+					if info.Strategy == "" {
+						readerErrors <- fmt.Errorf("empty strategy in lastFindInfo")
+					}
+					// Validate that time is not zero
+					if info.Time.IsZero() {
+						readerErrors <- fmt.Errorf("zero time in lastFindInfo")
+					}
+					// Validate consistency: strategy should be one of the known strategies
+					found := false
+					for _, s := range strategies {
+						if info.Strategy == s {
+							found = true
+							break
+						}
+					}
+					if !found {
+						readerErrors <- fmt.Errorf("unknown strategy: %s", info.Strategy)
+					}
+				}
+				// formatLastFind should never panic
+				_ = formatLastFind(stats)
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+
+	// Check for any errors
+	select {
+	case err := <-readerErrors:
+		t.Errorf("Concurrent read detected inconsistency: %v", err)
+	default:
+		// No errors, test passed
+	}
+
+	// Verify final state
+	info := stats.getLastFind()
+	if info == nil {
+		t.Error("Expected lastFind to be set after writes")
+		return
+	}
+	if info.Strategy == "" {
+		t.Error("Expected non-empty strategy")
+	}
+
+	// Verify coverageFinds counter
+	finds := atomic.LoadInt64(&stats.coverageFinds)
+	expected := int64(numWriters * writesPerWriter)
+	if finds != expected {
+		t.Errorf("Expected %d coverage finds, got %d", expected, finds)
+	}
 }

@@ -434,6 +434,31 @@ The splicing strategy needs "donor" inputs to combine with the current input:
 
 ### Understanding the UI Metrics
 
+#### Last Coverage Find (LAST field)
+
+The `LAST` field shows when and which strategy most recently improved coverage:
+
+```
+LAST: 12s (mutation:bytecode)   # 12 seconds ago via bytecode mutation
+LAST: 5s (generation:ecrecover) # 5 seconds ago via ecrecover generator
+LAST: never (none)              # No coverage finds yet
+```
+
+**Format:** `LAST: <duration> (<strategy>)`
+
+**Strategy names:**
+- Mutation strategies: `mutation:bytecode`, `mutation:havoc`, `mutation:splicing`, `mutation:original`, etc.
+- Generation strategies: `generation:ecrecover`, `generation:bn254`, `generation:bls`, etc.
+
+**Use cases:**
+- **Diagnose stalls**: When coverage growth slows, see which strategy was last productive
+- **Validate strategies**: Confirm that specific strategies (e.g., `generation:ecrecover`) are working
+- **A/B testing feedback**: Real-time indication of which approach is "hot"
+
+The time and strategy are updated atomically to ensure consistency in multi-worker scenarios.
+
+#### Corpus Statistics
+
 ```
 CORPUS: seeds=54861 hp_q=1142(added=1159) splice=1142 | HP_PICKS: 18234 (80.1%) SEED_PICKS: 4521
 RETENTION: avg_picks=16.0 culled=17 total_priority=285420
@@ -664,7 +689,7 @@ Recommendation: Consider increasing splicing weight in mutation mix,
  RUNTIME: 30s           WORKERS: 22    STRATEGY: combined
 ───────────────────────────────────────────────────────────────────
  EXEC: 186005 (6197/s)  CRASH: 0  TIMEOUT: 0
- COV:  31.646%  FINDS: 31  LAST: 27s  GROWTH: +0.0000%/min
+ COV:  31.646%  FINDS: 31  LAST: 27s (mutation:bytecode)  GROWTH: +0.0000%/min
  SEEDS: 54861  HP_QUEUE: 0  SPLICING: 31  SAVED: 31
 ═══════════════════════════════════════════════════════════════════
 
