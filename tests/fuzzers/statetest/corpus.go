@@ -94,10 +94,11 @@ type CoverageCorpus struct {
 	maxSplicingLen int     // Maximum splicing pool size
 
 	// Retention config
-	decayRate     float64 // Priority decay per pick (default: 0.95)
-	minPriority   int     // Cull threshold (default: 100)
-	cullInterval  int     // Cull every N pops (default: 1000)
-	popsSinceCull int     // Counter for inline culling
+	decayRate      float64 // Priority decay per pick (default: 0.99)
+	minPriority    int     // Cull threshold (default: 1)
+	cullInterval   int     // Cull every N pops (default: 1000)
+	popsSinceCull  int     // Counter for inline culling
+	minPicksToCull int     // Minimum picks before item can be culled (default: 10)
 
 	// Stats
 	maxCoverage      float64   // Maximum coverage achieved
@@ -167,6 +168,15 @@ func WithCullInterval(interval int) CoverageCorpusOption {
 	}
 }
 
+// WithMinPicksToCull sets minimum picks before item becomes eligible for culling
+func WithMinPicksToCull(picks int) CoverageCorpusOption {
+	return func(c *CoverageCorpus) {
+		if picks >= 0 {
+			c.minPicksToCull = picks
+		}
+	}
+}
+
 // NewCoverageCorpus creates a corpus with initial seeds
 func NewCoverageCorpus(seeds [][]byte, opts ...CoverageCorpusOption) *CoverageCorpus {
 	c := &CoverageCorpus{
@@ -179,9 +189,10 @@ func NewCoverageCorpus(seeds [][]byte, opts ...CoverageCorpusOption) *CoverageCo
 		maxQueueSize:   10000, // Default max queue size
 		highPriorityP:  0.8,   // 80% chance to pick high priority
 		maxSplicingLen: 10000, // Default max splicing pool
-		decayRate:      0.95,  // Default decay rate
-		minPriority:    100,   // Default cull threshold
+		decayRate:      0.99,  // Slow decay: ~460 picks to reach minPriority from 100
+		minPriority:    1,     // Only cull truly exhausted items
 		cullInterval:   1000,  // Default cull every 1000 pops
+		minPicksToCull: 10,    // Item must be picked 10+ times before culling eligible
 		popsSinceCull:  0,
 		lastFindTime:   time.Now(),
 		totalCulled:    0,
@@ -286,7 +297,8 @@ func (c *CoverageCorpus) applyDecayLocked(item *PriorityInput) {
 	item.Priority = newPriority
 }
 
-// cullLocked removes items below minPriority. MUST be called with c.mu held.
+// cullLocked removes items below minPriority that have been picked enough times.
+// MUST be called with c.mu held.
 func (c *CoverageCorpus) cullLocked() int {
 	if len(c.hpQueue) == 0 {
 		return 0
@@ -296,7 +308,8 @@ func (c *CoverageCorpus) cullLocked() int {
 	culled := 0
 
 	for _, item := range c.hpQueue {
-		if item.Priority > c.minPriority {
+		// Keep item if: priority is above threshold OR hasn't been picked enough times
+		if item.Priority > c.minPriority || item.PickCount < int64(c.minPicksToCull) {
 			newQueue = append(newQueue, item)
 		} else {
 			// Remove from index

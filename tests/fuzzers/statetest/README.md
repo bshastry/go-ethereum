@@ -208,6 +208,384 @@ FUZZ_STRATEGY=combined go test -cover -run=TestFuzzStateTestCustomMutator -v ./t
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Architecture Deep Dive: Queues and Retention
+
+The fuzzer maintains three distinct data structures that work together to maximize coverage exploration efficiency. Understanding their interaction is key to understanding the fuzzer's behavior.
+
+### The Three Queues
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CoverageCorpus Structure                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. NORMAL SEEDS ([][]byte)                                                 │
+│     ─────────────────────────                                               │
+│     • Original corpus (e.g., goevmlab 54,861 tests)                         │
+│     • Round-robin access via seedIndex                                      │
+│     • Never modified during fuzzing                                         │
+│     • Used when HP queue is empty or RNG selects seeds                      │
+│                                                                             │
+│  2. HIGH PRIORITY QUEUE ([]*PriorityInput)                                  │
+│     ─────────────────────────────────────────                               │
+│     • Coverage-finding inputs with retention                                │
+│     • Weighted random selection by priority                                 │
+│     • Items STAY after being picked (retention model)                       │
+│     • Priority decays with each pick                                        │
+│     • Items culled when exhausted (low priority + enough picks)             │
+│     • O(1) lookup via SHA256 hash index for deduplication                   │
+│                                                                             │
+│  3. SPLICING POOL ([][]byte)                                                │
+│     ─────────────────────────                                               │
+│     • All coverage-finding inputs (permanent)                               │
+│     • Used by splicing mutation strategy                                    │
+│     • 70% weight in donor selection (30% from seeds)                        │
+│     • Max size 10,000 (random replacement when full)                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Input Selection Flow
+
+When `Pop()` is called:
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                            Pop() Decision Tree                             │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  1. RNG roll: r < highPriorityP (default 80%)?                            │
+│     │                                                                     │
+│     ├── YES ─┬── HP queue empty? ──────────────────┬── YES ──► Seeds      │
+│     │        │                                     │                      │
+│     │        └── NO ─► Weighted random selection ──┘                      │
+│     │              from HP queue by priority                              │
+│     │                                                                     │
+│     └── NO ──────────────────────────────────────────────────► Seeds      │
+│                                                                           │
+│  Result: Either HP item (with decay applied) or seed (round-robin)        │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Retention Model
+
+Unlike traditional consume-once queues, the HP queue implements **retention with decay**:
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         PriorityInput Lifecycle                            │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  DISCOVERY                                                                │
+│  ───────────                                                              │
+│  When input finds new coverage:                                           │
+│    Priority = coverageDelta × 1,000,000                                   │
+│    BasePriority = Priority (stored for reference)                         │
+│    PickCount = 0                                                          │
+│                                                                           │
+│  ON EACH PICK                                                             │
+│  ─────────────                                                            │
+│    PickCount++                                                            │
+│    Priority = Priority × decayRate (default 0.99)                         │
+│    Priority = max(Priority, minPriority) (floor at 1)                     │
+│                                                                           │
+│  CULLING (every cullInterval=1000 pops)                                   │
+│  ─────────────────────────────────────                                    │
+│    Item is culled if BOTH conditions are true:                            │
+│      1. Priority ≤ minPriority (1)                                        │
+│      2. PickCount ≥ minPicksToCull (10)                                   │
+│                                                                           │
+│  EXAMPLE LIFECYCLE                                                        │
+│  ─────────────────                                                        │
+│    coverageDelta=0.0003 → Priority=300                                    │
+│    After 50 picks: 300 × 0.99^50 = 182                                    │
+│    After 200 picks: 300 × 0.99^200 = 40                                   │
+│    After 500 picks: 300 × 0.99^500 = 2 → eligible for culling             │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Culling Math
+
+With default parameters:
+- `decayRate = 0.99` (1% priority reduction per pick)
+- `minPriority = 1` (floor value)
+- `minPicksToCull = 10` (minimum picks before eligible)
+
+**Formula**: Picks to reach minPriority from initial priority P:
+```
+n = log(minPriority / P) / log(decayRate)
+n = log(1 / P) / log(0.99)
+
+Examples:
+  P=300   (typical delta=0.0003): ~568 picks to reach threshold
+  P=1000  (delta=0.001):          ~688 picks to reach threshold
+  P=10000 (delta=0.01):           ~918 picks to reach threshold
+```
+
+The slow decay ensures high-value inputs get many mutation attempts before being culled, while items that stop producing new coverage are eventually removed to keep the queue fresh.
+
+### Weighted Random Selection
+
+Items are selected with probability proportional to their current priority:
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                      Weighted Selection Algorithm                          │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Running sum: totalPriority = Σ(item.Priority) for all items              │
+│                                                                           │
+│  Selection:                                                               │
+│    1. target = random(0, totalPriority)                                   │
+│    2. cumulative = 0                                                      │
+│    3. For each item:                                                      │
+│         cumulative += item.Priority                                       │
+│         if cumulative > target: return item                               │
+│                                                                           │
+│  Complexity: O(n) selection, O(1) totalPriority maintenance               │
+│                                                                           │
+│  EXAMPLE                                                                  │
+│  ───────                                                                  │
+│  Queue: [A(p=100), B(p=300), C(p=50)]                                     │
+│  totalPriority = 450                                                      │
+│                                                                           │
+│  Selection probabilities:                                                 │
+│    A: 100/450 = 22%                                                       │
+│    B: 300/450 = 67%                                                       │
+│    C: 50/450  = 11%                                                       │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Splice Donor Selection
+
+The splicing strategy needs "donor" inputs to combine with the current input:
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                        Splice Donor Selection                              │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  GetRandomInput() called by SplicingStrategy:                             │
+│                                                                           │
+│    ┌─── RNG roll < 70? ───┐                                               │
+│    │                      │                                               │
+│    │  YES                 │  NO                                           │
+│    │   │                  │   │                                           │
+│    ▼   │                  ▼   │                                           │
+│  splicingPool         normalSeeds                                         │
+│  (coverage-finders)   (expert EEST tests)                                 │
+│                                                                           │
+│  RATIONALE                                                                │
+│  ─────────                                                                │
+│  • 70% coverage pool: Inputs that found new paths                         │
+│  • 30% seeds: EEST tests with expert-designed edge cases                  │
+│  • Keeps EVM-specific edge cases in play even after                       │
+│    many coverage-finding inputs have been discovered                      │
+│                                                                           │
+│  TRACKING                                                                 │
+│  ────────                                                                 │
+│  UI displays: SPLICE_DONORS: coverage=N (X%) seeds=M (Y%)                 │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### How Queues Work Together
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                     Mutation → Execution → Feedback                        │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  1. POP: Get base input                                                   │
+│     │                                                                     │
+│     ├── 80%: HP queue (weighted by priority)                              │
+│     │        Item stays in queue, priority decays                         │
+│     │                                                                     │
+│     └── 20%: Seeds (round-robin)                                          │
+│              Original corpus cycling                                      │
+│                                                                           │
+│  2. MUTATE: Apply mutation strategy                                       │
+│     │                                                                     │
+│     └── If splicing strategy selected:                                    │
+│         Call GetRandomInput() for donor                                   │
+│         ├── 70%: From splicingPool (coverage-finders)                     │
+│         └── 30%: From normalSeeds (EEST expert tests)                     │
+│                                                                           │
+│  3. EXECUTE: Run mutated input                                            │
+│     │                                                                     │
+│     └── Measure coverage delta                                            │
+│                                                                           │
+│  4. FEEDBACK: If new coverage found                                       │
+│     │                                                                     │
+│     ├── Add to HP queue (priority = delta × 1,000,000)                    │
+│     │   └── If duplicate: boost existing item's priority instead          │
+│     │                                                                     │
+│     └── Add to splicingPool (permanent, for future donors)                │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Understanding the UI Metrics
+
+```
+CORPUS: seeds=54861 hp_q=1142(added=1159) splice=1142 | HP_PICKS: 18234 (80.1%) SEED_PICKS: 4521
+RETENTION: avg_picks=16.0 culled=17 total_priority=285420
+SPLICE_DONORS: coverage=8234 (70.2%) seeds=3490 (29.8%)
+```
+
+| Metric | Source | Meaning |
+|--------|--------|---------|
+| `seeds=54861` | `len(normalSeeds)` | Original corpus size |
+| `hp_q=1142` | `len(hpQueue)` | Current HP queue size |
+| `added=1159` | `totalInputsAdded` | Total ever added to HP queue |
+| `splice=1142` | `len(splicingPool)` | Splicing donor pool size |
+| `HP_PICKS: 18234 (80.1%)` | `hpPicks` | Times HP queue was selected |
+| `SEED_PICKS: 4521` | `seedPicks` | Times seeds were selected |
+| `avg_picks=16.0` | Computed | Average PickCount across HP items |
+| `culled=17` | `totalCulled` | Items removed from HP queue |
+| `total_priority=285420` | `totalPriority` | Sum of all priorities (for weighted selection) |
+| `coverage=8234 (70.2%)` | `spliceCoverageDonors` | Splice donors from coverage pool |
+| `seeds=3490 (29.8%)` | `spliceSeedDonors` | Splice donors from original seeds |
+
+### Configuration Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `decayRate` | 0.99 | Priority multiplier per pick (higher = slower decay) |
+| `minPriority` | 1 | Floor value before culling eligible |
+| `minPicksToCull` | 10 | Minimum picks before culling eligible |
+| `cullInterval` | 1000 | Check for culling every N pops |
+| `highPriorityP` | 0.8 | Probability of selecting from HP queue |
+| `maxQueueSize` | 10000 | Max HP queue size (0 = unlimited) |
+| `maxSplicingLen` | 10000 | Max splicing pool size |
+
+Configuration via functional options:
+```go
+corpus := NewCoverageCorpus(seeds,
+    WithDecayRate(0.995),        // Even slower decay
+    WithMinPriority(1),          // Keep default
+    WithMinPicksToCull(20),      // Require more picks before culling
+    WithHighPriorityProbability(0.9), // More HP-focused
+)
+```
+
+### Source Statistics: Cumulative vs Per-Interval
+
+**Important**: All source statistics (TOP_SOURCES, MUT/GEN totals, SOURCE BREAKDOWN) are **cumulative from the start of the run** - they are NOT reset between progress reports.
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                      How Source Stats Work                                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  RECORDING (happens during fuzzing)                                       │
+│  ──────────────────────────────────                                       │
+│                                                                           │
+│  1. When Next() returns an input:                                         │
+│     - source = "mutation:bytecode" or "generation:ecrecover" etc.         │
+│     - recordInput(source) → increments sourceBreakdown[source].Inputs     │
+│                                                                           │
+│  2. When Feedback() is called with coverageDelta:                         │
+│     - recordFeedback(source, delta)                                       │
+│     - If delta > 0:                                                       │
+│       → increments sourceBreakdown[source].CoverageFinds                  │
+│       → adds delta to sourceBreakdown[source].TotalDelta                  │
+│                                                                           │
+│  DISPLAY (every 3 seconds)                                                │
+│  ─────────────────────────                                                │
+│                                                                           │
+│  TOP_SOURCES: Shows top 3 by CoverageFinds (cumulative, since start)      │
+│  MUT/GEN:     Shows aggregate totals [mutation_total] and [generation_total] │
+│  SOURCE BREAKDOWN: Final report shows all sources with their stats        │
+│                                                                           │
+│  ALL STATS ARE CUMULATIVE - never reset during the run                    │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Comparing Mutation vs Generation Effectiveness
+
+When running A/B tests (`--ab` mode), there are multiple metrics to compare effectiveness:
+
+```
+MUT: 45/12000 (0.38%)  GEN: 23/8000 (0.29%)
+TOP_SOURCES: mutation:bytecode(15), generation:ecrecover(12), mutation:havoc(10)
+```
+
+**Key Metrics:**
+
+| Metric | What It Measures | How to Use |
+|--------|------------------|------------|
+| **Find Rate** | `CoverageFinds / Inputs` | Higher = more efficient at finding new coverage per attempt |
+| **Find Count** | Raw `CoverageFinds` | Higher = contributed more absolute coverage |
+| **Total Delta** | Sum of coverage deltas | Higher = found more significant coverage |
+| **Avg Delta per Find** | `TotalDelta / CoverageFinds` | Higher = each find is more valuable |
+
+**Interpreting Results:**
+
+1. **Find Rate** is the primary efficiency metric:
+   ```
+   MUT: 45/12000 (0.38%)  → 0.38% find rate
+   GEN: 23/8000 (0.29%)   → 0.29% find rate
+   ```
+   Here mutation is more efficient (0.38% vs 0.29%).
+
+2. **Find Count** shows absolute contribution:
+   - If mutation has 45 finds and generation has 23, mutation contributed ~2x more coverage.
+   - But consider input counts: mutation ran 12000 inputs, generation only 8000.
+
+3. **TOP_SOURCES** shows which specific strategies are working:
+   ```
+   TOP_SOURCES: mutation:bytecode(15), generation:ecrecover(12), mutation:havoc(10)
+   ```
+   - `mutation:bytecode` is the top performer with 15 finds
+   - `generation:ecrecover` (a generative strategy) is 2nd with 12 finds
+   - Numbers in parentheses are cumulative find counts
+
+4. **Final SOURCE BREAKDOWN** gives the complete picture:
+   ```
+   ╠═══════════════════════════════════════════════════════════════════╣
+   ║                       SOURCE BREAKDOWN                            ║
+   ╠═══════════════════════════════════════════════════════════════════╣
+   ║ [mutation_total]     inputs=12000    finds=45     rate=0.375%    ║
+   ║ [generation_total]   inputs=8000     finds=23     rate=0.288%    ║
+   ║ mutation:bytecode    inputs=2400     finds=15     rate=0.625%    ║
+   ║ generation:ecrecover inputs=1600     finds=12     rate=0.750%    ║
+   ║ mutation:havoc       inputs=2000     finds=10     rate=0.500%    ║
+   ```
+
+   Look at the **rate column** for efficiency:
+   - `generation:ecrecover` has 0.750% rate (highest!)
+   - `mutation:bytecode` has 0.625% rate
+   - Overall mutation has 0.375%, generation has 0.288%
+
+**Recommendations:**
+
+1. **For overall strategy comparison**: Use the aggregate `[mutation_total]` vs `[generation_total]` find rates
+2. **For fine-tuning weights**: Look at individual source find rates in SOURCE BREAKDOWN
+3. **For quick checks during run**: Watch TOP_SOURCES to see which strategies are currently winning
+4. **For statistical significance**: Run for at least 10-15 minutes to get meaningful sample sizes
+
+**Example Analysis:**
+
+```
+After 30 minutes:
+MUT: 145/45000 (0.32%)  GEN: 89/35000 (0.25%)
+
+Conclusion: Mutation is more efficient overall (0.32% vs 0.25%)
+
+TOP_SOURCES: mutation:splicing(42), mutation:bytecode(38), generation:precompile(35)
+
+Conclusion: Splicing is the most effective individual strategy.
+            The precompile generator is competitive with top mutation strategies.
+
+Recommendation: Consider increasing splicing weight in mutation mix,
+                or creating more precompile-focused generators.
+```
+
 ## Output Example
 
 ```
