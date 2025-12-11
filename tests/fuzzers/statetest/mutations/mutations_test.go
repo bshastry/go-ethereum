@@ -324,3 +324,124 @@ func TestArithmeticHelpers(t *testing.T) {
 		t.Errorf("trimHexPrefix(abc) = %s, want abc", trimmed)
 	}
 }
+
+// EIP-7825 Gas Strategy Tests
+
+func TestGasStrategyEIP7825Constants(t *testing.T) {
+	// Test that the EIP-7825 constant is defined correctly
+	const expected uint64 = 1 << 24 // 16,777,216
+	if MaxTxGasEIP7825 != expected {
+		t.Errorf("MaxTxGasEIP7825 = %d, want %d", MaxTxGasEIP7825, expected)
+	}
+}
+
+func TestGasStrategyForkDetection(t *testing.T) {
+	testCases := []struct {
+		fork        string
+		isPostOsaka bool
+	}{
+		{"Frontier", false},
+		{"London", false},
+		{"Cancun", false},
+		{"Prague", false},
+		{"Osaka", true},
+		{"Fusaka", true},
+		{"", false}, // Default
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.fork, func(t *testing.T) {
+			s := NewGasStrategyForFork(tc.fork)
+			if got := s.IsPostOsaka(); got != tc.isPostOsaka {
+				t.Errorf("IsPostOsaka() = %v, want %v", got, tc.isPostOsaka)
+			}
+		})
+	}
+}
+
+func TestGasStrategyBoundaryValues(t *testing.T) {
+	strategy := NewGasStrategyForFork("Osaka")
+	values := strategy.GetInterestingGasValues()
+
+	// Verify EIP-7825 boundary values are present
+	boundaryMap := map[uint64]bool{
+		(1 << 24) - 1: false, // Just under cap
+		(1 << 24):     false, // At cap
+		(1 << 24) + 1: false, // Just over cap
+	}
+
+	for _, v := range values {
+		if _, exists := boundaryMap[v]; exists {
+			boundaryMap[v] = true
+		}
+	}
+
+	for val, found := range boundaryMap {
+		if !found {
+			t.Errorf("expected EIP-7825 boundary value %d not found in interesting values", val)
+		}
+	}
+}
+
+func TestGasStrategyMaxRandomGas(t *testing.T) {
+	t.Run("pre-osaka uses 30M max", func(t *testing.T) {
+		s := NewGasStrategyForFork("Prague")
+		if got := s.GetMaxRandomGas(); got != 30_000_000 {
+			t.Errorf("GetMaxRandomGas() = %d, want 30000000", got)
+		}
+	})
+
+	t.Run("post-osaka uses 2^24 max", func(t *testing.T) {
+		s := NewGasStrategyForFork("Osaka")
+		if got := s.GetMaxRandomGas(); got != (1 << 24) {
+			t.Errorf("GetMaxRandomGas() = %d, want %d", got, 1<<24)
+		}
+	})
+}
+
+func TestGasStrategyPreOsakaValuesExcludedPostOsaka(t *testing.T) {
+	// Pre-Osaka should include large values
+	preOsaka := NewGasStrategyForFork("Prague")
+	preValues := preOsaka.GetInterestingGasValues()
+
+	found30M := false
+	for _, v := range preValues {
+		if v == 30_000_000 {
+			found30M = true
+			break
+		}
+	}
+	if !found30M {
+		t.Error("pre-Osaka strategy should include 30M gas value")
+	}
+
+	// Post-Osaka should NOT include the pre-Osaka-only large values in the common pool
+	postOsaka := NewGasStrategyForFork("Osaka")
+	postValues := postOsaka.GetInterestingGasValues()
+
+	for _, v := range postValues {
+		// 30M and 0xFFFFFFFF should not be in post-Osaka common values
+		// (except as boundary test values which we handle separately)
+		if v == 30_000_000 || v == 0xFFFFFFFF {
+			t.Errorf("post-Osaka strategy should not include %d in common values", v)
+		}
+	}
+}
+
+func TestGasStrategyBackwardCompatibility(t *testing.T) {
+	// NewGasStrategy() should work as before (pre-Osaka behavior)
+	s := NewGasStrategy()
+	if s == nil {
+		t.Fatal("NewGasStrategy() returned nil")
+	}
+
+	// Should behave as pre-Osaka (not post-Osaka)
+	if s.IsPostOsaka() {
+		t.Error("NewGasStrategy() should default to pre-Osaka behavior")
+	}
+
+	// Should have 30M max random gas
+	if got := s.GetMaxRandomGas(); got != 30_000_000 {
+		t.Errorf("default GetMaxRandomGas() = %d, want 30000000", got)
+	}
+}

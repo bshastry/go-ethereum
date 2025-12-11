@@ -24,14 +24,36 @@ import (
 	"strings"
 )
 
+// EIP-7825 Gas Limit Constants
+const (
+	// MaxTxGasEIP7825 is the EIP-7825 transaction gas limit cap (Osaka/Fusaka).
+	// Transactions with gasLimit > 2^24 are invalid post-Osaka.
+	MaxTxGasEIP7825 uint64 = 1 << 24 // 16,777,216
+
+	// MaxTxGasPreOsaka is the max gas for pre-Osaka forks (block gas limit region).
+	MaxTxGasPreOsaka uint64 = 30_000_000
+)
+
 // GasStrategy mutates transaction gas limits to test gas metering edge cases.
 type GasStrategy struct {
-	rng *rand.Rand
+	rng      *rand.Rand
+	forkName string
 }
 
-// NewGasStrategy creates a new gas mutation strategy.
+// NewGasStrategy creates a new gas mutation strategy with default (pre-Osaka) behavior.
 func NewGasStrategy() *GasStrategy {
-	return &GasStrategy{rng: rand.New(rand.NewSource(rand.Int63()))}
+	return &GasStrategy{
+		rng:      rand.New(rand.NewSource(rand.Int63())),
+		forkName: "",
+	}
+}
+
+// NewGasStrategyForFork creates a new gas mutation strategy configured for a specific fork.
+func NewGasStrategyForFork(fork string) *GasStrategy {
+	return &GasStrategy{
+		rng:      rand.New(rand.NewSource(rand.Int63())),
+		forkName: fork,
+	}
 }
 
 // Name returns the strategy name.
@@ -43,26 +65,75 @@ func (s *GasStrategy) Description() string { return "Gas limit mutations (bounda
 // Weight returns the relative weight for this strategy.
 func (s *GasStrategy) Weight() int { return 8 }
 
-// interestingGasValues contains interesting gas values for fuzzing.
-var interestingGasValues = []uint64{
+// interestingGasValuesCommon contains gas values valid for all forks (values <= 10M).
+var interestingGasValuesCommon = []uint64{
 	0,
 	1,
-	21000,          // Base tx cost
-	21001,          // Just above base
-	20999,          // Just below base
-	53000,          // CREATE cost region
-	32000,          // CALL stipend region
-	2300,           // Call stipend
-	2600,           // COLD_ACCOUNT_ACCESS (EIP-2929)
-	100,            // WARM_STORAGE_READ
-	20000,          // SSTORE_SET
-	5000,           // SSTORE_RESET
-	100000,         // Common test value
-	1000000,        // Higher gas
-	10000000,       // 10M gas
+	21000,    // Base tx cost
+	21001,    // Just above base
+	20999,    // Just below base
+	53000,    // CREATE cost region
+	32000,    // CALL stipend region
+	2300,     // Call stipend
+	2600,     // COLD_ACCOUNT_ACCESS (EIP-2929)
+	100,      // WARM_STORAGE_READ
+	20000,    // SSTORE_SET
+	5000,     // SSTORE_RESET
+	100000,   // Common test value
+	1000000,  // Higher gas
+	10000000, // 10M gas
+}
+
+// interestingGasValuesEIP7825Boundary contains EIP-7825 boundary values (2^24 region).
+var interestingGasValuesEIP7825Boundary = []uint64{
+	MaxTxGasEIP7825 - 1, // 16,777,215 - Just under cap (valid)
+	MaxTxGasEIP7825,     // 16,777,216 - At cap (valid)
+	MaxTxGasEIP7825 + 1, // 16,777,217 - Just over cap (invalid post-Osaka)
+}
+
+// interestingGasValuesPreOsaka contains large gas values only valid pre-Osaka.
+var interestingGasValuesPreOsaka = []uint64{
 	30000000,       // Block gas limit region
 	0xFFFFFFFF,     // Max uint32
 	0xFFFFFFFFFFFF, // Large value
+}
+
+// IsPostOsaka returns true if this strategy is configured for Osaka or later forks.
+func (s *GasStrategy) IsPostOsaka() bool {
+	switch s.forkName {
+	case "Osaka", "Fusaka":
+		return true
+	default:
+		return false
+	}
+}
+
+// GetInterestingGasValues returns the interesting gas values for the configured fork.
+// For post-Osaka forks, it includes EIP-7825 boundary values and excludes
+// pre-Osaka-only large values. For pre-Osaka forks, it includes all values.
+func (s *GasStrategy) GetInterestingGasValues() []uint64 {
+	if s.IsPostOsaka() {
+		// Post-Osaka: common values + EIP-7825 boundary values
+		result := make([]uint64, 0, len(interestingGasValuesCommon)+len(interestingGasValuesEIP7825Boundary))
+		result = append(result, interestingGasValuesCommon...)
+		result = append(result, interestingGasValuesEIP7825Boundary...)
+		return result
+	}
+	// Pre-Osaka: common values + pre-Osaka large values
+	result := make([]uint64, 0, len(interestingGasValuesCommon)+len(interestingGasValuesPreOsaka))
+	result = append(result, interestingGasValuesCommon...)
+	result = append(result, interestingGasValuesPreOsaka...)
+	return result
+}
+
+// GetMaxRandomGas returns the maximum random gas value for the configured fork.
+// For post-Osaka forks, this is 2^24 (EIP-7825 cap).
+// For pre-Osaka forks, this is 30M (block gas limit region).
+func (s *GasStrategy) GetMaxRandomGas() uint64 {
+	if s.IsPostOsaka() {
+		return MaxTxGasEIP7825
+	}
+	return MaxTxGasPreOsaka
 }
 
 // Mutate performs mutation on raw JSON test data.
@@ -123,10 +194,14 @@ func (s *GasStrategy) Mutate(data []byte) ([]byte, string, error) {
 	var newGas uint64
 	strategy := s.rng.Intn(100)
 
+	// Get fork-aware interesting values and max random gas
+	interestingValues := s.GetInterestingGasValues()
+	maxRandomGas := s.GetMaxRandomGas()
+
 	switch {
 	case strategy < 40:
-		// Use interesting value
-		newGas = interestingGasValues[s.rng.Intn(len(interestingGasValues))]
+		// Use interesting value (fork-aware)
+		newGas = interestingValues[s.rng.Intn(len(interestingValues))]
 	case strategy < 70:
 		// Parse current and adjust
 		var gasHex string
@@ -141,8 +216,8 @@ func (s *GasStrategy) Mutate(data []byte) ([]byte, string, error) {
 			newGas = 0
 		}
 	default:
-		// Random gas
-		newGas = uint64(s.rng.Int63n(30000000))
+		// Random gas (fork-aware max)
+		newGas = uint64(s.rng.Int63n(int64(maxRandomGas)))
 	}
 
 	newGasHex := fmt.Sprintf("0x%x", newGas)
