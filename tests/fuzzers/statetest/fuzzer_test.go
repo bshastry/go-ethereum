@@ -156,11 +156,13 @@ func (s *FuzzStats) logCrossVMDivergence(input []byte, expectedHash, actualHash,
 //
 // Environment variables:
 //
-//	FUZZ_DURATION:   How long to run (default: 2m)
-//	FUZZ_SEED_DIR:   Seed directory (default: testdata/seeds)
-//	FUZZ_WORKERS:    Number of workers (default: NumCPU)
-//	FUZZ_STRATEGY:   Mutation strategy (default: combined)
-//	FUZZ_CORPUS_DIR: Output corpus directory for trace-enhanced entries (default: testdata/enhanced_corpus)
+//	FUZZ_DURATION:    How long to run (default: 2m)
+//	FUZZ_SEED_DIR:    Seed directory (default: testdata/seeds)
+//	FUZZ_WORKERS:     Number of workers (default: NumCPU)
+//	FUZZ_STRATEGY:    Mutation strategy (default: combined)
+//	FUZZ_CORPUS_DIR:  Output corpus directory for trace-enhanced entries (default: testdata/enhanced_corpus)
+//	FUZZ_METRICS_FILE: Base path for metrics CSV export (optional, e.g., /tmp/fuzz_run1)
+//	                   Creates {path}_main.csv and {path}_sources.csv
 //
 // For A/B testing with generators, see TestFuzzStateTestAB.
 func TestFuzzStateTestCustomMutator(t *testing.T) {
@@ -234,8 +236,20 @@ func TestFuzzStateTestCustomMutator(t *testing.T) {
 		go worker(i, corpus, workerMutator, &wg, stats, testTimeout, corpusSaver)
 	}
 
+	// Initialize metrics exporter if configured
+	var metricsExporter *MetricsExporter
+	if metricsPath := getEnvOrDefault("FUZZ_METRICS_FILE", ""); metricsPath != "" {
+		var err error
+		metricsExporter, err = NewMetricsExporter(metricsPath)
+		if err != nil {
+			t.Fatalf("Failed to create metrics exporter: %v", err)
+		}
+		defer metricsExporter.Close()
+		t.Logf("  Metrics:    %s_main.csv, %s_sources.csv", metricsPath, metricsPath)
+	}
+
 	// Progress reporter
-	go progressReporter(t, stats, corpus)
+	go progressReporter(t, stats, corpus, metricsExporter)
 
 	// Run until duration expires
 	time.Sleep(duration)
@@ -447,7 +461,7 @@ func executeStateTestWithContext(ctx context.Context, testJSON []byte) (crashed 
 }
 
 // progressReporter logs progress periodically
-func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
+func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus, metricsExporter *MetricsExporter) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -504,6 +518,13 @@ func progressReporter(t *testing.T, stats *FuzzStats, corpus *CoverageCorpus) {
 				t.Logf(" CROSS-VM: verified=%d  divergences=%d", crossVMVerified, crossVMFailed)
 			}
 			t.Logf("═══════════════════════════════════════════════════════════════════")
+
+			// Export metrics if enabled (mutation-only mode: provider=nil)
+			if metricsExporter != nil {
+				if err := metricsExporter.Record(stats, nil, corpus); err != nil {
+					t.Logf("Warning: failed to record metrics: %v", err)
+				}
+			}
 
 		case <-stats.done:
 			return
@@ -714,6 +735,9 @@ func BenchmarkCustomMutatorFuzzer(b *testing.B) {
 //	FUZZ_WORKERS:         Number of workers (default: NumCPU)
 //	FUZZ_STRATEGY:        Mutation strategy (default: combined)
 //	FUZZ_CORPUS_DIR:      Output corpus directory (default: testdata/enhanced_corpus)
+//	FUZZ_METRICS_FILE:    Base path for metrics CSV export (optional, e.g., /tmp/fuzz_run1)
+//	                      Creates {path}_main.csv and {path}_sources.csv for post-run analysis.
+//	                      Use scripts/plot_fuzz_metrics.py to visualize.
 func TestFuzzStateTestAB(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping A/B fuzz test in short mode")
@@ -808,8 +832,20 @@ func TestFuzzStateTestAB(t *testing.T) {
 		go workerWithProvider(i, provider, &wg, stats, testTimeout, corpusSaver)
 	}
 
-	// Progress reporter with provider stats
-	go progressReporterAB(t, stats, provider)
+	// Initialize metrics exporter if configured
+	var metricsExporter *MetricsExporter
+	if metricsPath := getEnvOrDefault("FUZZ_METRICS_FILE", ""); metricsPath != "" {
+		var err error
+		metricsExporter, err = NewMetricsExporter(metricsPath)
+		if err != nil {
+			t.Fatalf("Failed to create metrics exporter: %v", err)
+		}
+		defer metricsExporter.Close()
+		t.Logf("  Metrics:    %s_main.csv, %s_sources.csv", metricsPath, metricsPath)
+	}
+
+	// Progress reporter with provider stats (corpus already declared above)
+	go progressReporterAB(t, stats, provider, corpus, metricsExporter)
 
 	// Run until duration expires
 	time.Sleep(duration)
@@ -901,7 +937,7 @@ func workerWithProvider(
 }
 
 // progressReporterAB logs progress with provider-specific stats.
-func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider) {
+func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider, corpus *CoverageCorpus, metricsExporter *MetricsExporter) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -993,6 +1029,13 @@ func progressReporterAB(t *testing.T, stats *FuzzStats, provider InputProvider) 
 			}
 
 			t.Logf("═══════════════════════════════════════════════════════════════════")
+
+			// Export metrics if enabled
+			if metricsExporter != nil {
+				if err := metricsExporter.Record(stats, provider, corpus); err != nil {
+					t.Logf("Warning: failed to record metrics: %v", err)
+				}
+			}
 
 		case <-stats.done:
 			return

@@ -125,6 +125,7 @@ The `fuzz.sh` script provides sensible defaults and automatically includes EVM c
 | `FUZZ_SEED_DIR` | `testdata/seeds` | Directory containing seed JSON files |
 | `FUZZ_STRATEGY` | `combined` | Mutation strategy to use |
 | `FUZZ_CORPUS_DIR` | `testdata/enhanced_corpus` | Output directory for trace-enhanced corpus entries |
+| `FUZZ_METRICS_FILE` | _(disabled)_ | Base path for CSV metrics export (e.g., `/tmp/fuzz_run1`) |
 | `FUZZ_ADAPTIVE_HP` | `false` | Enable adaptive HP probability (opt-in) |
 | `FUZZ_ADAPTIVE_HP_MIN` | `0.2` | Minimum HP probability bound |
 | `FUZZ_ADAPTIVE_HP_MAX` | `0.95` | Maximum HP probability bound |
@@ -727,6 +728,7 @@ tests/fuzzers/statetest/
 ├── normalizer.go          # Cross-client trace normalization
 ├── tracing.go             # Tracing execution wrapper
 ├── corpus_saver.go        # Enhanced corpus saving
+├── metrics_exporter.go    # CSV metrics export for analysis
 ├── mutations/
 │   ├── strategy.go        # Core interfaces
 │   ├── integration.go     # RawMutator adapter
@@ -922,6 +924,102 @@ To participate in cross-VM debugging:
 3. Include `_meta` header with normalizer version
 4. Optionally support `--dump-filtered` for filtered entry logging
 5. Include `_result` footer with traceHash and finalLineHash
+
+## Metrics Export
+
+Export longitudinal fuzzing metrics to CSV files for post-run analysis and visualization. This enables tracking coverage growth, execution rates, HP queue dynamics, and source effectiveness over time.
+
+### Enabling Metrics Export
+
+```bash
+# Set FUZZ_METRICS_FILE to enable CSV export
+FUZZ_METRICS_FILE=/tmp/fuzz_run1 FUZZ_DURATION=1h go test -cover \
+  -run=TestFuzzStateTestAB ./tests/fuzzers/statetest/ -timeout=2h
+```
+
+This creates two files:
+- `/tmp/fuzz_run1_main.csv` - Scalar metrics (one row per 3-second sample)
+- `/tmp/fuzz_run1_sources.csv` - Per-source breakdown (mutation strategies, generators)
+
+### Main CSV Columns
+
+| Column | Description |
+|--------|-------------|
+| `timestamp` | Unix timestamp |
+| `elapsed_sec` | Seconds since start |
+| `provider` | Provider name (mutation, generation, hybrid) |
+| `coverage_pct` | Code coverage percentage |
+| `exec_total` | Total executions |
+| `exec_per_sec` | Execution rate |
+| `coverage_finds` | Total coverage finds |
+| `crashes` | Total crashes |
+| `timeouts` | Total timeouts |
+| `hp_queue_len` | HP queue size |
+| `hp_picks` / `seed_picks` | Input source selection counts |
+| `effective_hp_prob` | Adaptive HP probability |
+| `mutation_finds_total` | Finds from mutation strategies |
+| `generation_finds_total` | Finds from generators |
+
+### Sources CSV Columns
+
+| Column | Description |
+|--------|-------------|
+| `timestamp` | Unix timestamp (same as main.csv) |
+| `source_type` | "mutation" or "generation" |
+| `source_name` | Strategy name (bytecode, havoc, ecrecover, etc.) |
+| `inputs` | Total inputs from this source |
+| `finds` | Coverage finds from this source |
+| `find_rate` | `finds / inputs` |
+| `total_delta` | Cumulative coverage delta |
+
+### Visualization
+
+Use the included Python script to generate plots:
+
+```bash
+# Install dependencies (one-time)
+pip3 install pandas matplotlib seaborn numpy
+
+# Generate all plots
+python3 scripts/plot_fuzz_metrics.py /tmp/fuzz_run1
+
+# With options
+python3 scripts/plot_fuzz_metrics.py /tmp/fuzz_run1 --top-n 15 --output-dir ./plots
+```
+
+**Generated plots:**
+
+| Plot | Description |
+|------|-------------|
+| `_coverage.png` | Coverage percentage over time |
+| `_exec_rate.png` | Executions per second over time |
+| `_hp_queue.png` | HP queue size and culling (dual y-axis) |
+| `_picks.png` | Stacked area chart of HP vs seed picks |
+| `_adaptive_hp.png` | Effective HP probability (if adaptive enabled) |
+| `_mutation_sources.png` | Top N mutation sources over time |
+| `_generation_sources.png` | Top N generation sources over time |
+| `_source_heatmap.png` | Find rate heatmap for top sources |
+| `_final_distribution.png` | Final finds by source (bar chart) |
+
+### Example: 24-Hour A/B Test with Metrics
+
+```bash
+FUZZ_METRICS_FILE=/tmp/fuzz_ab_24h \
+FUZZ_ADAPTIVE_HP=true \
+FUZZ_DURATION=24h \
+FUZZ_MUTATION_RATIO=0.5 \
+FUZZ_FORK=Osaka \
+FUZZ_SEED_DIR=$(pwd)/../goevmlab/corpus \
+FUZZ_CORPUS_DIR=$(pwd)/out-$(date -I) \
+FUZZ_WORKERS=22 \
+FUZZ_PROVIDER=hybrid \
+go test -cover -coverpkg=$COVERPKG \
+  -tags=generators -run=TestFuzzStateTestAB \
+  ./tests/fuzzers/statetest/ -timeout=25h -v
+
+# After completion, generate analysis
+python3 scripts/plot_fuzz_metrics.py /tmp/fuzz_ab_24h --output-dir ./analysis
+```
 
 ## Performance
 
