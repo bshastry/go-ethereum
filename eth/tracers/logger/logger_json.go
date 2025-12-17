@@ -59,6 +59,7 @@ type jsonLogger struct {
 	cfg     *Config
 	env     *tracing.VMContext
 	hooks   *tracing.Hooks
+	usedGas uint64 // normalized gas from receipt (intrinsic + execution - refunds)
 }
 
 // NewJSONLogger creates a new EVM tracer that prints execution steps as JSON objects
@@ -70,6 +71,7 @@ func NewJSONLogger(cfg *Config, writer io.Writer) *tracing.Hooks {
 	}
 	l.hooks = &tracing.Hooks{
 		OnTxStart:         l.OnTxStart,
+		OnTxEnd:           l.OnTxEnd,
 		OnSystemCallStart: l.onSystemCallStart,
 		OnExit:            l.OnExit,
 		OnOpcode:          l.OnOpcode,
@@ -87,6 +89,7 @@ func NewJSONLoggerWithCallFrames(cfg *Config, writer io.Writer) *tracing.Hooks {
 	}
 	l.hooks = &tracing.Hooks{
 		OnTxStart:         l.OnTxStart,
+		OnTxEnd:           l.OnTxEnd,
 		OnSystemCallStart: l.onSystemCallStart,
 		OnEnter:           l.OnEnter,
 		OnExit:            l.OnExit,
@@ -162,9 +165,26 @@ func (l *jsonLogger) OnExit(depth int, output []byte, gasUsed uint64, err error,
 	if err != nil {
 		errMsg = err.Error()
 	}
-	l.encoder.Encode(endLog{common.Bytes2Hex(output), math.HexOrDecimal64(gasUsed), errMsg})
+	// For the top-level call (depth 0), use normalized gas from the transaction receipt
+	// which includes intrinsic gas and applies refunds per EIP-3529 rules.
+	// For subcalls (depth > 0), report the actual execution gas consumed by that call frame.
+	finalGas := gasUsed
+	if depth == 0 && l.usedGas > 0 {
+		finalGas = l.usedGas
+	}
+	l.encoder.Encode(endLog{common.Bytes2Hex(output), math.HexOrDecimal64(finalGas), errMsg})
 }
 
 func (l *jsonLogger) OnTxStart(env *tracing.VMContext, tx *types.Transaction, from common.Address) {
 	l.env = env
+	l.usedGas = 0 // Reset for new transaction
+}
+
+// OnTxEnd captures the normalized gas usage from the transaction receipt.
+// receipt.GasUsed contains the final gas charged to the transaction:
+// intrinsic_gas + execution_gas - refunds (capped per EIP-3529).
+func (l *jsonLogger) OnTxEnd(receipt *types.Receipt, err error) {
+	if receipt != nil {
+		l.usedGas = receipt.GasUsed
+	}
 }
