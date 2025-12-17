@@ -54,12 +54,24 @@ func (c *callFrame) Type() string {
 	return c.op.String()
 }
 
+// executionSummary is emitted at the end of execution (call frame exit or transaction end).
+type executionSummary struct {
+	Output  string              `json:"output"`
+	GasUsed math.HexOrDecimal64 `json:"gasUsed"`
+	Err     string              `json:"error,omitempty"`
+}
+
 type jsonLogger struct {
 	encoder *json.Encoder
 	cfg     *Config
 	env     *tracing.VMContext
 	hooks   *tracing.Hooks
-	usedGas uint64 // normalized gas from receipt (intrinsic + execution - refunds)
+	// Pending depth-0 output: we defer writing the summary until OnTxEnd
+	// so we have access to the normalized gas from the receipt.
+	pendingOutput  []byte
+	pendingGasUsed uint64
+	pendingErr     error
+	hasPending     bool
 }
 
 // NewJSONLogger creates a new EVM tracer that prints execution steps as JSON objects
@@ -156,35 +168,53 @@ func (l *jsonLogger) OnEnter(depth int, typ byte, from common.Address, to common
 }
 
 func (l *jsonLogger) OnExit(depth int, output []byte, gasUsed uint64, err error, reverted bool) {
-	type endLog struct {
-		Output  string              `json:"output"`
-		GasUsed math.HexOrDecimal64 `json:"gasUsed"`
-		Err     string              `json:"error,omitempty"`
+	if depth == 0 {
+		// For the top-level call, defer output until OnTxEnd so we can use
+		// the normalized gas from the receipt (intrinsic + execution - refunds).
+		l.pendingOutput = output
+		l.pendingGasUsed = gasUsed
+		l.pendingErr = err
+		l.hasPending = true
+		return
 	}
+
+	// For subcalls (depth > 0), output immediately with execution gas.
 	var errMsg string
 	if err != nil {
 		errMsg = err.Error()
 	}
-	// For the top-level call (depth 0), use normalized gas from the transaction receipt
-	// which includes intrinsic gas and applies refunds per EIP-3529 rules.
-	// For subcalls (depth > 0), report the actual execution gas consumed by that call frame.
-	finalGas := gasUsed
-	if depth == 0 && l.usedGas > 0 {
-		finalGas = l.usedGas
-	}
-	l.encoder.Encode(endLog{common.Bytes2Hex(output), math.HexOrDecimal64(finalGas), errMsg})
+	l.encoder.Encode(executionSummary{common.Bytes2Hex(output), math.HexOrDecimal64(gasUsed), errMsg})
 }
 
 func (l *jsonLogger) OnTxStart(env *tracing.VMContext, tx *types.Transaction, from common.Address) {
 	l.env = env
-	l.usedGas = 0 // Reset for new transaction
+	// Reset pending state for new transaction
+	l.pendingOutput = nil
+	l.pendingGasUsed = 0
+	l.pendingErr = nil
+	l.hasPending = false
 }
 
-// OnTxEnd captures the normalized gas usage from the transaction receipt.
+// OnTxEnd outputs the deferred depth-0 summary with normalized gas from the receipt.
 // receipt.GasUsed contains the final gas charged to the transaction:
 // intrinsic_gas + execution_gas - refunds (capped per EIP-3529).
 func (l *jsonLogger) OnTxEnd(receipt *types.Receipt, err error) {
-	if receipt != nil {
-		l.usedGas = receipt.GasUsed
+	if !l.hasPending {
+		return
 	}
+
+	var errMsg string
+	if l.pendingErr != nil {
+		errMsg = l.pendingErr.Error()
+	}
+
+	// Use normalized gas from receipt if available, otherwise fall back to execution gas.
+	// The receipt contains intrinsic_gas + execution_gas - refunds.
+	finalGas := l.pendingGasUsed
+	if receipt != nil && receipt.GasUsed > 0 {
+		finalGas = receipt.GasUsed
+	}
+
+	l.encoder.Encode(executionSummary{common.Bytes2Hex(l.pendingOutput), math.HexOrDecimal64(finalGas), errMsg})
+	l.hasPending = false
 }
