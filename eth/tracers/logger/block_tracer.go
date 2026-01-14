@@ -490,7 +490,9 @@ func (t *blockTracer) OnTxEnd(receipt *types.Receipt, err error) {
 
 	if err != nil {
 		record["status"] = "0x0"
-		record["error"] = err.Error()
+		// Note: error field removed from txEnd to align with Nethermind's output format.
+		// Nethermind's current architecture doesn't pass validation errors through EndTxTrace().
+		// The error is still available in blockEnd for failed blocks.
 	}
 
 	// Remove any nil optional fields for canonical format
