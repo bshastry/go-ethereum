@@ -353,7 +353,8 @@ func (t *blockTracer) OnBlockEnd(err error) {
 
 	if err != nil {
 		record["validationResult"] = "invalid"
-		record["error"] = err.Error()
+		// Note: We intentionally do NOT include the error field in blockEnd.
+		// Errors are reported in testEnd for failed tests, not at the block level.
 	}
 
 	// Optional post-Shanghai fields
