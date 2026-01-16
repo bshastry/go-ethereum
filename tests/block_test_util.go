@@ -309,6 +309,9 @@ func matchesSingleException(actualErr error, expectedCode string) bool {
 		"transactionexception.insufficient_funds":   {"insufficient funds", "insufficient balance"},
 		"transactionexception.intrinsic_gas":        {"intrinsic gas"},
 		"transactionexception.intrinsic_gas_too_low": {"intrinsic gas too low", "intrinsic gas"},
+		// Type 3 (blob) transactions cannot be contract creations - they must have a To address
+		// RLP decode fails when To field is missing in a blob tx
+		"transactionexception.type_3_tx_contract_creation": {"blobtx).to", "input string too short for common.address"},
 	}
 
 	// Check if any pattern matches
