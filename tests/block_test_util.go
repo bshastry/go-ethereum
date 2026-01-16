@@ -304,10 +304,11 @@ func matchesSingleException(actualErr error, expectedCode string) bool {
 		"blockexception.invalid_block_timestamp":                  {"timestamp"},
 		"blockexception.invalid_block_timestamp_older_than_parent": {"invalid timestamp"},
 		"blockexception.unknown_parent":                            {"unknown ancestor", "unknown parent"},
-		"transactionexception.nonce_too_low":       {"nonce too low"},
-		"transactionexception.nonce_too_high":      {"nonce too high"},
-		"transactionexception.insufficient_funds":  {"insufficient funds", "insufficient balance"},
-		"transactionexception.intrinsic_gas":       {"intrinsic gas"},
+		"transactionexception.nonce_too_low":        {"nonce too low"},
+		"transactionexception.nonce_too_high":       {"nonce too high"},
+		"transactionexception.insufficient_funds":   {"insufficient funds", "insufficient balance"},
+		"transactionexception.intrinsic_gas":        {"intrinsic gas"},
+		"transactionexception.intrinsic_gas_too_low": {"intrinsic gas too low", "intrinsic gas"},
 	}
 
 	// Check if any pattern matches
