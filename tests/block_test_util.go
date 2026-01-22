@@ -312,6 +312,12 @@ func matchesSingleException(actualErr error, expectedCode string) bool {
 		// Type 3 (blob) transactions cannot be contract creations - they must have a To address
 		// RLP decode fails when To field is missing in a blob tx
 		"transactionexception.type_3_tx_contract_creation": {"blobtx).to", "input string too short for common.address"},
+		// Type 3 (blob) transactions must have at least one blob hash per EIP-4844
+		"transactionexception.type_3_tx_zero_blobs": {"blob transaction missing blob hashes"},
+		// Nonce overflow - nonce at max uint64 value cannot be incremented
+		"transactionexception.nonce_is_max": {"nonce has max value"},
+		// EIP-3860: initcode size limit exceeded (49152 bytes max)
+		"transactionexception.initcode_size_exceeded": {"max initcode size exceeded", "initcode size exceeded"},
 	}
 
 	// Check if any pattern matches
